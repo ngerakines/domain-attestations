@@ -1,0 +1,33 @@
+{
+  "manifest_version": 2,
+  "name": "DID HTTP Signature Verifier",
+  "version": "1.0.0",
+  "description": "Verifies RFC 9421 HTTP Message Signatures on did:web DID documents using ECDSA P-256",
+
+  "permissions": [
+    "webRequest",
+    "webRequestBlocking",
+    "<all_urls>",
+    "storage"
+  ],
+
+  "background": {
+    "scripts": ["background.js"]
+  },
+
+  "browser_action": {
+    "default_icon": {
+      "16": "icons/default-16.png",
+      "32": "icons/default-32.png",
+      "48": "icons/default-48.png"
+    },
+    "default_title": "DID HTTP Signature Verifier",
+    "default_popup": "popup.html"
+  },
+
+  "icons": {
+    "16": "icons/default-16.png",
+    "32": "icons/default-32.png",
+    "48": "icons/default-48.png"
+  }
+}
