@@ -1,0 +1,16 @@
+{
+  "name": "did-http-signature-verifier",
+  "version": "1.0.0",
+  "description": "Firefox extension for verifying RFC 9421 HTTP Message Signatures on did:web DID documents",
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/background.ts --bundle --outfile=background.js --format=iife --platform=browser --target=firefox102 && esbuild src/popup.ts --bundle --outfile=popup.js --format=iife --platform=browser --target=firefox102",
+    "watch": "esbuild src/background.ts src/popup.ts --bundle --outdir=. --format=iife --platform=browser --target=firefox102 --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/firefox-webext-browser": "^120.0.4",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  }
+}

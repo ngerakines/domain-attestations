@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>DID HTTP Signature Verification</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      min-width: 600px;
+      max-width: 700px;
+      margin: 0;
+      padding: 0;
+      font-size: 13px;
+    }
+
+    .header {
+      background: #0066cc;
+      color: white;
+      padding: 12px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .header-buttons {
+      display: flex;
+      gap: 8px;
+    }
+
+    .header-button {
+      background: rgba(255, 255, 255, 0.2);
+      border: none;
+      color: white;
+      padding: 4px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .header-button:hover {
+      background: rgba(255, 255, 255, 0.3);
+    }
+
+    .tabs {
+      display: flex;
+      border-bottom: 1px solid #ddd;
+      background: #f5f5f5;
+    }
+
+    .tab {
+      padding: 10px 20px;
+      cursor: pointer;
+      border: none;
+      background: none;
+      font-size: 13px;
+      color: #666;
+      border-bottom: 2px solid transparent;
+    }
+
+    .tab.active {
+      color: #0066cc;
+      border-bottom-color: #0066cc;
+      background: white;
+      font-weight: 500;
+    }
+
+    .tab:hover {
+      background: rgba(0, 102, 204, 0.05);
+    }
+
+    .content {
+      padding: 16px;
+      max-height: 500px;
+      overflow-y: auto;
+    }
+
+    .status {
+      display: flex;
+      align-items: center;
+      padding: 12px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      font-weight: 500;
+    }
+
+    .status.verified {
+      background: #e6f4ea;
+      color: #137333;
+      border: 1px solid #b8e0c4;
+    }
+
+    .status.failed {
+      background: #fce8e6;
+      color: #c5221f;
+      border: 1px solid #f4c2c2;
+    }
+
+    .status.pending {
+      background: #f0f0f0;
+      color: #666;
+      border: 1px solid #ddd;
+    }
+
+    .status-icon {
+      font-size: 20px;
+      margin-right: 10px;
+    }
+
+    .history-item {
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      margin-bottom: 12px;
+      overflow: hidden;
+    }
+
+    .history-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px;
+      background: #f8f8f8;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .history-header:hover {
+      background: #f0f0f0;
+    }
+
+    .history-url {
+      font-family: 'Monaco', monospace;
+      font-size: 12px;
+      color: #333;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      margin-right: 12px;
+    }
+
+    .history-meta {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 11px;
+      color: #666;
+    }
+
+    .history-status {
+      font-weight: 600;
+    }
+
+    .history-status.verified {
+      color: #137333;
+    }
+
+    .history-status.failed {
+      color: #c5221f;
+    }
+
+    .history-details {
+      display: none;
+      padding: 0 12px 12px 12px;
+    }
+
+    .history-item.expanded .history-details {
+      display: block;
+    }
+
+    .history-item.expanded .expand-icon {
+      transform: rotate(90deg);
+    }
+
+    .expand-icon {
+      transition: transform 0.2s;
+      color: #666;
+    }
+
+    .step-list {
+      margin-top: 8px;
+    }
+
+    .step {
+      display: flex;
+      align-items: flex-start;
+      padding: 8px;
+      border-left: 3px solid #e0e0e0;
+      margin-bottom: 4px;
+      background: #fafafa;
+      border-radius: 4px;
+    }
+
+    .step.success {
+      border-left-color: #34a853;
+      background: #f6fdf8;
+    }
+
+    .step.failed {
+      border-left-color: #ea4335;
+      background: #fef7f7;
+    }
+
+    .step.pending {
+      border-left-color: #fbbc04;
+      background: #fffef6;
+    }
+
+    .step-icon {
+      font-size: 16px;
+      margin-right: 8px;
+      min-width: 20px;
+    }
+
+    .step-content {
+      flex: 1;
+    }
+
+    .step-name {
+      font-weight: 500;
+      font-size: 12px;
+      margin-bottom: 2px;
+    }
+
+    .step-details {
+      font-size: 11px;
+      color: #666;
+      font-family: 'Monaco', monospace;
+      margin-top: 4px;
+    }
+
+    .step-time {
+      font-size: 10px;
+      color: #999;
+      margin-left: auto;
+      padding-left: 8px;
+    }
+
+    .detail-section {
+      margin: 12px 0;
+    }
+
+    .detail-section h3 {
+      font-size: 11px;
+      font-weight: 600;
+      color: #666;
+      margin: 0 0 6px 0;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .detail-item {
+      display: flex;
+      padding: 6px 0;
+      border-bottom: 1px solid #f0f0f0;
+      font-size: 12px;
+    }
+
+    .detail-label {
+      font-weight: 500;
+      color: #333;
+      min-width: 120px;
+    }
+
+    .detail-value {
+      color: #666;
+      font-family: 'Monaco', monospace;
+      font-size: 11px;
+      word-break: break-all;
+      flex: 1;
+    }
+
+    .error-list {
+      list-style: none;
+      padding: 0;
+      margin: 8px 0;
+    }
+
+    .error-list li {
+      padding: 6px 12px;
+      background: #fef7f7;
+      border-left: 3px solid #c5221f;
+      margin-bottom: 4px;
+      font-size: 12px;
+    }
+
+    .url {
+      font-size: 11px;
+      color: #666;
+      word-break: break-all;
+      margin-top: 6px;
+      padding: 6px;
+      background: #f8f8f8;
+      border-radius: 4px;
+      font-family: 'Monaco', monospace;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 40px 20px;
+      color: #999;
+    }
+
+    .empty-state-icon {
+      font-size: 48px;
+      margin-bottom: 12px;
+    }
+
+    .footer {
+      padding: 10px 16px;
+      background: #f8f8f8;
+      border-top: 1px solid #e0e0e0;
+      font-size: 10px;
+      color: #666;
+      text-align: center;
+    }
+
+    .footer a {
+      color: #0066cc;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span>DID HTTP Signature Verifier</span>
+    <div class="header-buttons">
+      <button class="header-button" id="clear-history">Clear History</button>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="current">Current</button>
+    <button class="tab" data-tab="history">History</button>
+  </div>
+
+  <div class="content">
+    <div id="current-tab" class="tab-content">
+      <div id="status" class="status pending">
+        <div class="status-icon">&#x23F3;</div>
+        <div>No verification data available</div>
+      </div>
+
+      <div id="details"></div>
+    </div>
+
+    <div id="history-tab" class="tab-content" style="display: none;">
+      <div id="history-list"></div>
+    </div>
+  </div>
+
+  <div class="footer">
+    RFC 9421 HTTP Message Signatures &bull; ECDSA P-256 &bull; did:web Verification
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

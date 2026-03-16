@@ -1,0 +1,27 @@
+{
+	order httpsig before respond
+}
+
+:8080 {
+	httpsig {
+		key_file /path/to/ecdsa-p256-private.pem
+		key_id my-server-key
+		covered @status content-type
+	}
+
+	respond /.well-known/did.json `{"id":"did:web:example.com"}` 200 {
+		Content-Type application/json
+	}
+}
+
+# Alternative: load key from environment variable
+# :8080 {
+# 	httpsig {
+# 		key_env HTTPSIG_PRIVATE_KEY
+# 		key_id my-server-key
+# 	}
+#
+# 	respond /.well-known/did.json `{"id":"did:web:example.com"}` 200 {
+# 		Content-Type application/json
+# 	}
+# }
