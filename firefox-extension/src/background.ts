@@ -330,6 +330,57 @@ async function verifyEcdsaSignature(
   }
 }
 
+// ── JWK Thumbprint ─────────────────────────────────────────────────
+
+/**
+ * Compute the RFC 7638 JWK Thumbprint (SHA-256, base64url) for an EC key.
+ *
+ * The canonical JSON uses the required members in lexicographic order:
+ * crv, kty, x, y — matching the Python implementation in server-py.
+ */
+async function computeJwkThumbprint(jwk: EcPublicJwk): Promise<string> {
+  const canonical = JSON.stringify({
+    crv: jwk.crv,
+    kty: jwk.kty,
+    x: jwk.x,
+    y: jwk.y,
+  });
+  const data = new TextEncoder().encode(canonical);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  const bytes = new Uint8Array(hash);
+  let binary = "";
+  for (const b of bytes) {
+    binary += String.fromCharCode(b);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * Find a verification method in a DID document whose key matches the
+ * given reference key by JWK thumbprint.
+ *
+ * This is used for cross-document key matching where verification method
+ * IDs differ between identities.
+ */
+async function findVerificationMethodByThumbprint(
+  didDoc: DidDocument,
+  referenceJwk: EcPublicJwk,
+): Promise<VerificationMethod | undefined> {
+  if (!didDoc.verificationMethod) return undefined;
+
+  const targetThumbprint = await computeJwkThumbprint(referenceJwk);
+
+  for (const vm of didDoc.verificationMethod) {
+    if (!vm.publicKeyJwk) continue;
+    const vmThumbprint = await computeJwkThumbprint(vm.publicKeyJwk);
+    if (vmThumbprint === targetThumbprint) {
+      return vm;
+    }
+  }
+
+  return undefined;
+}
+
 // ── DID Document Helpers ───────────────────────────────────────────
 
 /** Fetch the DID document at `{origin}/.well-known/did.json`. */
@@ -433,11 +484,11 @@ async function resolveDidDocument(did: string): Promise<DidDocument> {
 
 /**
  * Resolve a single linked DID and check whether it contains a
- * verification method matching the given keyid.
+ * verification method with the same key (matched by JWK thumbprint).
  */
 async function checkLinkedDid(
   did: string,
-  keyid: string,
+  referenceJwk: EcPublicJwk,
   relationship: "controller" | "alsoKnownAs",
   addStep: (name: string, status: VerificationStep["status"], info?: Record<string, unknown>) => void,
 ): Promise<LinkedDidCheck> {
@@ -454,7 +505,7 @@ async function checkLinkedDid(
 
   try {
     const linkedDoc = await resolveDidDocument(did);
-    const vm = findVerificationMethod(linkedDoc, keyid);
+    const vm = await findVerificationMethodByThumbprint(linkedDoc, referenceJwk);
 
     if (vm) {
       addStep(stepName, "success", {
@@ -467,7 +518,6 @@ async function checkLinkedDid(
       addStep(stepName, "failed", {
         did,
         resolvedId: linkedDoc.id,
-        keyid,
         availableMethods: linkedDoc.verificationMethod?.map((v) => v.id) ?? [],
       });
       return { did, relationship, status: "failed", keyFound: false, error: "Key not found in linked document" };
@@ -481,11 +531,11 @@ async function checkLinkedDid(
 
 /**
  * Check all linked DIDs referenced by a DID document's `controller`
- * and `alsoKnownAs` fields.
+ * and `alsoKnownAs` fields, matching keys by JWK thumbprint.
  */
 async function performLinkedDidChecks(
   didDoc: DidDocument,
-  keyid: string,
+  referenceJwk: EcPublicJwk,
   addStep: (name: string, status: VerificationStep["status"], info?: Record<string, unknown>) => void,
 ): Promise<LinkedDidCheck[]> {
   const checks: LinkedDidCheck[] = [];
@@ -498,7 +548,7 @@ async function performLinkedDidChecks(
 
     for (const controller of controllers) {
       if (controller === didDoc.id) continue;
-      checks.push(await checkLinkedDid(controller, keyid, "controller", addStep));
+      checks.push(await checkLinkedDid(controller, referenceJwk, "controller", addStep));
     }
   }
 
@@ -506,7 +556,7 @@ async function performLinkedDidChecks(
   if (didDoc.alsoKnownAs) {
     for (const aka of didDoc.alsoKnownAs) {
       if (!aka.startsWith("did:")) continue;
-      checks.push(await checkLinkedDid(aka, keyid, "alsoKnownAs", addStep));
+      checks.push(await checkLinkedDid(aka, referenceJwk, "alsoKnownAs", addStep));
     }
   }
 
@@ -697,7 +747,7 @@ async function verifyHttpSignature(
       try {
         const linkedChecks = await performLinkedDidChecks(
           didDoc,
-          sigParams.keyid ?? "",
+          jwk,
           addStep,
         );
         if (linkedChecks.length > 0) {
