@@ -171,6 +171,91 @@
       `Unsupported key format in verification method: ${Object.keys(vm).join(", ")}`
     );
   }
+  function resolveDidToUrl(did) {
+    if (did.startsWith("did:web:")) {
+      const rest = did.slice("did:web:".length);
+      const parts = rest.split(":");
+      const host = decodeURIComponent(parts[0]);
+      if (parts.length === 1) {
+        return `https://${host}/.well-known/did.json`;
+      }
+      const path = parts.slice(1).join("/");
+      return `https://${host}/${path}/did.json`;
+    }
+    if (did.startsWith("did:plc:")) {
+      return `https://plc.directory/${did}`;
+    }
+    if (did.startsWith("did:key:")) {
+      return null;
+    }
+    return null;
+  }
+  async function resolveDidDocument(did) {
+    const url = resolveDidToUrl(did);
+    if (!url) {
+      throw new Error(`Cannot resolve DID: ${did}`);
+    }
+    console.log("[HTTP Sig] Resolving DID document:", did, "\u2192", url);
+    const response = await fetch(url, {
+      headers: { Accept: "application/json" }
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to resolve ${did}: HTTP ${response.status}`);
+    }
+    return await response.json();
+  }
+  async function checkLinkedDid(did, keyid, relationship, addStep) {
+    const label = relationship === "controller" ? "Controller" : "alsoKnownAs";
+    const stepName = `Resolve ${label}: ${did}`;
+    if (resolveDidToUrl(did) === null) {
+      addStep(stepName, "success", { skipped: true, reason: "Self-describing DID method" });
+      return { did, relationship, status: "skipped", error: "Self-describing DID method (no document to fetch)" };
+    }
+    addStep(stepName, "pending", { did });
+    try {
+      const linkedDoc = await resolveDidDocument(did);
+      const vm = findVerificationMethod(linkedDoc, keyid);
+      if (vm) {
+        addStep(stepName, "success", {
+          did,
+          resolvedId: linkedDoc.id,
+          matchingMethod: vm.id
+        });
+        return { did, relationship, status: "success", keyFound: true };
+      } else {
+        addStep(stepName, "failed", {
+          did,
+          resolvedId: linkedDoc.id,
+          keyid,
+          availableMethods: linkedDoc.verificationMethod?.map((v) => v.id) ?? []
+        });
+        return { did, relationship, status: "failed", keyFound: false, error: "Key not found in linked document" };
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      addStep(stepName, "failed", { did, error: message });
+      return { did, relationship, status: "failed", error: message };
+    }
+  }
+  async function performLinkedDidChecks(didDoc, keyid, addStep) {
+    const checks = [];
+    if (didDoc.controller) {
+      const controllers = Array.isArray(didDoc.controller) ? didDoc.controller : [didDoc.controller];
+      for (const controller of controllers) {
+        if (controller === didDoc.id)
+          continue;
+        checks.push(await checkLinkedDid(controller, keyid, "controller", addStep));
+      }
+    }
+    if (didDoc.alsoKnownAs) {
+      for (const aka of didDoc.alsoKnownAs) {
+        if (!aka.startsWith("did:"))
+          continue;
+        checks.push(await checkLinkedDid(aka, keyid, "alsoKnownAs", addStep));
+      }
+    }
+    return checks;
+  }
   async function verifyHttpSignature(details) {
     const startTime = Date.now();
     const steps = [];
@@ -308,6 +393,19 @@
         addStep("Verify ECDSA P-256 Signature", "success");
         result.verified = true;
         console.log("[HTTP Sig] Signature verified successfully");
+        try {
+          const linkedChecks = await performLinkedDidChecks(
+            didDoc,
+            sigParams.keyid ?? "",
+            addStep
+          );
+          if (linkedChecks.length > 0) {
+            result.linkedDidChecks = linkedChecks;
+          }
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          addStep("Linked DID Checks", "failed", { error: msg });
+        }
       } else {
         addStep("Verify ECDSA P-256 Signature", "failed");
         result.errors.push("Signature verification failed");

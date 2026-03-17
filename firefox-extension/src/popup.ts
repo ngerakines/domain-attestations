@@ -12,6 +12,14 @@ interface VerificationStep {
   timestamp: number;
 }
 
+interface LinkedDidCheck {
+  did: string;
+  relationship: "controller" | "alsoKnownAs";
+  status: "success" | "failed" | "skipped";
+  error?: string;
+  keyFound?: boolean;
+}
+
 interface VerificationResult {
   url: string;
   timestamp: string;
@@ -20,6 +28,7 @@ interface VerificationResult {
   details: Record<string, string | undefined>;
   steps: VerificationStep[];
   duration?: number;
+  linkedDidChecks?: LinkedDidCheck[];
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -97,6 +106,47 @@ function renderHistoryDetails(item: VerificationResult): string {
     html += "</div>";
   }
 
+  html += renderLinkedDidChecks(item.linkedDidChecks ?? []);
+
+  return html;
+}
+
+function renderLinkedDidChecks(checks: LinkedDidCheck[]): string {
+  if (!checks || checks.length === 0) return "";
+
+  let html = '<div class="detail-section"><h3>Linked DID Checks</h3>';
+  html += '<div class="step-list">';
+
+  for (const check of checks) {
+    const iconMap: Record<string, string> = {
+      success: "\u2713",
+      failed: "\u2717",
+      skipped: "\u22EF",
+    };
+    const icon = iconMap[check.status] ?? "\u2022";
+    const statusClass = check.status === "skipped" ? "pending" : check.status;
+    const label = check.relationship === "controller" ? "Controller" : "alsoKnownAs";
+
+    let detailsHtml = "";
+    if (check.keyFound !== undefined) {
+      detailsHtml += `Key found: ${check.keyFound}<br>`;
+    }
+    if (check.error) {
+      detailsHtml += escapeHtml(check.error);
+    }
+
+    html += `
+      <div class="step ${statusClass}">
+        <div class="step-icon">${icon}</div>
+        <div class="step-content">
+          <div class="step-name">${escapeHtml(label)}: ${escapeHtml(check.did)}</div>
+          ${detailsHtml ? `<div class="step-details">${detailsHtml}</div>` : ""}
+        </div>
+      </div>
+    `;
+  }
+
+  html += "</div></div>";
   return html;
 }
 
@@ -195,6 +245,8 @@ async function displayCurrentResult(): Promise<void> {
     }
     detailsHtml += "</div>";
   }
+
+  detailsHtml += renderLinkedDidChecks(result.linkedDidChecks ?? []);
 
   if (result.duration) {
     detailsHtml += `
