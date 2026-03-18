@@ -66,6 +66,7 @@ interface VerificationMethod {
   type: string;
   controller: string;
   publicKeyJwk?: EcPublicJwk;
+  publicKeyMultibase?: string;
 }
 
 /** Minimal shape of a DID document we need for verification. */
@@ -111,6 +112,158 @@ const ICONS: Record<string, IconPaths> = {
 };
 
 console.log("[HTTP Sig] Extension initialized");
+
+// ── did:key Resolution ────────────────────────────────────────────
+
+/** Convert a Uint8Array to a base64url string (no padding). */
+function uint8ArrayToBase64url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const b of bytes) {
+    binary += String.fromCharCode(b);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/** Decode a base58btc string (without the 'z' multibase prefix) to bytes. */
+function base58btcDecode(input: string): Uint8Array {
+  const alphabetMap = new Map<string, number>();
+  for (let i = 0; i < BASE58_ALPHABET.length; i++) {
+    alphabetMap.set(BASE58_ALPHABET[i], i);
+  }
+
+  // Convert from base-58 to a big integer (using BigInt)
+  let value = 0n;
+  for (const char of input) {
+    const digit = alphabetMap.get(char);
+    if (digit === undefined) {
+      throw new Error(`Invalid base58 character: ${char}`);
+    }
+    value = value * 58n + BigInt(digit);
+  }
+
+  // Convert big integer to bytes
+  const bytes: number[] = [];
+  while (value > 0n) {
+    bytes.unshift(Number(value & 0xffn));
+    value >>= 8n;
+  }
+
+  // Preserve leading zeros (each leading '1' in base58 = one zero byte)
+  for (const char of input) {
+    if (char !== "1") break;
+    bytes.unshift(0);
+  }
+
+  return new Uint8Array(bytes);
+}
+
+/**
+ * Decompress a SEC1 compressed P-256 public key (33 bytes) to x, y coordinates.
+ *
+ * Uses the P-256 curve equation y² = x³ + ax + b (mod p) and computes the
+ * modular square root via (y²)^((p+1)/4) mod p.
+ */
+function decompressP256Point(compressed: Uint8Array): { x: Uint8Array; y: Uint8Array } {
+  if (compressed.length !== 33) {
+    throw new Error(`Expected 33-byte compressed key, got ${compressed.length}`);
+  }
+  const prefix = compressed[0];
+  if (prefix !== 0x02 && prefix !== 0x03) {
+    throw new Error(`Invalid compression prefix: 0x${prefix.toString(16)}`);
+  }
+
+  const p = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn;
+  const b = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604bn;
+  const a = p - 3n;
+
+  // Read x coordinate
+  let xBig = 0n;
+  for (let i = 1; i < 33; i++) {
+    xBig = (xBig << 8n) | BigInt(compressed[i]);
+  }
+
+  // y² = x³ + ax + b (mod p)
+  const x3 = modPow(xBig, 3n, p);
+  const ySquared = ((x3 + a * xBig + b) % p + p) % p;
+
+  // Square root: y = ySquared^((p+1)/4) mod p
+  const yCandidate = modPow(ySquared, (p + 1n) / 4n, p);
+
+  // Choose the y with correct parity
+  const isEven = (yCandidate & 1n) === 0n;
+  const wantEven = prefix === 0x02;
+  const yBig = isEven === wantEven ? yCandidate : p - yCandidate;
+
+  return {
+    x: bigIntToUint8Array(xBig, 32),
+    y: bigIntToUint8Array(yBig, 32),
+  };
+}
+
+/** Modular exponentiation: base^exp mod m using binary method. */
+function modPow(base: bigint, exp: bigint, m: bigint): bigint {
+  let result = 1n;
+  base = ((base % m) + m) % m;
+  while (exp > 0n) {
+    if (exp & 1n) {
+      result = (result * base) % m;
+    }
+    exp >>= 1n;
+    base = (base * base) % m;
+  }
+  return result;
+}
+
+/** Convert a BigInt to a fixed-length Uint8Array (big-endian). */
+function bigIntToUint8Array(value: bigint, length: number): Uint8Array {
+  const result = new Uint8Array(length);
+  for (let i = length - 1; i >= 0; i--) {
+    result[i] = Number(value & 0xffn);
+    value >>= 8n;
+  }
+  return result;
+}
+
+/**
+ * Resolve a did:key identifier to an EC public key JWK.
+ *
+ * Supports P-256 keys (multicodec prefix 0x8024).
+ * Reference: atproto-identity-rs identify_key()
+ */
+function resolveDidKey(didKey: string): EcPublicJwk {
+  const multibaseValue = didKey.startsWith("did:key:")
+    ? didKey.slice("did:key:".length)
+    : didKey;
+
+  if (multibaseValue[0] !== "z") {
+    throw new Error("Expected base58btc multibase prefix 'z'");
+  }
+
+  const decoded = base58btcDecode(multibaseValue.slice(1));
+
+  if (decoded.length < 3) {
+    throw new Error("Decoded key data too short");
+  }
+
+  // Check multicodec prefix for P-256 public key
+  if (decoded[0] !== 0x80 || decoded[1] !== 0x24) {
+    throw new Error(
+      `Unsupported multicodec prefix: 0x${decoded[0].toString(16)}${decoded[1].toString(16)}`,
+    );
+  }
+
+  const compressedKey = decoded.slice(2);
+  const { x, y } = decompressP256Point(compressedKey);
+
+  return {
+    kty: "EC",
+    crv: "P-256",
+    x: uint8ArrayToBase64url(x),
+    y: uint8ArrayToBase64url(y),
+  };
+}
 
 // ── RFC 9421 Parsing ───────────────────────────────────────────────
 
@@ -302,11 +455,22 @@ function buildSignatureBase(
  */
 async function verifyEcdsaSignature(
   jwk: EcPublicJwk,
-  derSignature: Uint8Array,
+  signatureBytes: Uint8Array,
   message: string,
 ): Promise<boolean> {
   try {
-    const rawSignature = derToRaw(derSignature, 32);
+    let rawSignature: Uint8Array;
+    if (signatureBytes[0] === 0x30) {
+      // DER/ASN.1 encoded (produced by Go and Python)
+      rawSignature = derToRaw(signatureBytes, 32);
+    } else if (signatureBytes.length === 64) {
+      // Already IEEE P1363 format (r || s, 32 + 32)
+      rawSignature = signatureBytes;
+    } else {
+      throw new Error(
+        `Unknown signature format: length=${signatureBytes.length}, first byte=0x${signatureBytes[0].toString(16)}`,
+      );
+    }
 
     const publicKey = await crypto.subtle.importKey(
       "jwk",
@@ -420,6 +584,14 @@ function findVerificationMethod(
 function extractPublicKey(vm: VerificationMethod): EcPublicJwk {
   if (vm.publicKeyJwk) {
     return vm.publicKeyJwk;
+  }
+  if (vm.publicKeyMultibase) {
+    const value = vm.publicKeyMultibase;
+    // Handle both did:key:-prefixed and bare multibase values
+    if (value.startsWith("did:key:")) {
+      return resolveDidKey(value);
+    }
+    return resolveDidKey(`did:key:${value}`);
   }
   throw new Error(
     `Unsupported key format in verification method: ${Object.keys(vm).join(", ")}`,
@@ -625,7 +797,6 @@ async function verifyHttpSignature(
     const sigParams = parseSignatureInput(headers["signature-input"]);
     result.details.keyid = sigParams.keyid;
     result.details.created = sigParams.created;
-    result.details.algorithm = sigParams.alg;
     result.details.coveredComponents = sigParams.coveredComponents.join(", ");
     addStep("Parse Signature-Input", "success", {
       keyid: sigParams.keyid,
@@ -636,25 +807,39 @@ async function verifyHttpSignature(
         : "unknown",
     });
 
-    // Step 4: Validate algorithm
+    // Step 4: Validate algorithm (infer from did:key if not specified)
     addStep("Validate Algorithm", "pending");
-    if (sigParams.alg !== "ecdsa-p256-sha256") {
+    let effectiveAlg = sigParams.alg;
+    if (!effectiveAlg && sigParams.keyid?.startsWith("did:key:")) {
+      try {
+        const keyJwk = resolveDidKey(sigParams.keyid);
+        if (keyJwk.crv === "P-256") {
+          effectiveAlg = "ecdsa-p256-sha256";
+        }
+      } catch { /* will fail at key resolution step */ }
+    }
+    if (effectiveAlg !== "ecdsa-p256-sha256") {
       addStep("Validate Algorithm", "failed", {
-        algorithm: sigParams.alg,
+        algorithm: effectiveAlg ?? sigParams.alg,
         expected: "ecdsa-p256-sha256",
       });
-      result.errors.push(`Unsupported algorithm: ${sigParams.alg}`);
+      result.errors.push(`Unsupported algorithm: ${effectiveAlg ?? sigParams.alg}`);
       return result;
     }
-    addStep("Validate Algorithm", "success", { algorithm: "ecdsa-p256-sha256" });
+    result.details.algorithm = effectiveAlg;
+    addStep("Validate Algorithm", "success", {
+      algorithm: "ecdsa-p256-sha256",
+      inferred: !sigParams.alg,
+    });
 
-    // Step 5: Parse Signature bytes (DER-encoded)
+    // Step 5: Parse Signature bytes
     addStep("Parse Signature", "pending");
     const signatureName = sigParams.signatureName || "sig";
     const signature = parseSignature(headers["signature"], signatureName);
+    const sigFormat = signature[0] === 0x30 ? "DER/ASN.1" : signature.length === 64 ? "IEEE P1363" : "unknown";
     addStep("Parse Signature", "success", {
       signatureLength: signature.length,
-      format: "DER/ASN.1",
+      format: sigFormat,
     });
 
     // Step 6: Parse URL components for derived-component resolution
@@ -684,31 +869,66 @@ async function verifyHttpSignature(
       verificationMethods: didDoc.verificationMethod?.length ?? 0,
     });
 
-    // Step 8: Find the matching verification method
-    addStep("Find Verification Method", "pending", {
-      searchingFor: sigParams.keyid,
-    });
-    const vm = findVerificationMethod(didDoc, sigParams.keyid ?? "");
-    if (!vm) {
-      addStep("Find Verification Method", "failed", {
-        keyid: sigParams.keyid,
-        availableMethods: didDoc.verificationMethod?.map((v) => v.id) ?? [],
-      });
-      result.errors.push(`Verification method not found: ${sigParams.keyid}`);
-      return result;
-    }
-    addStep("Find Verification Method", "success", {
-      methodId: vm.id,
-      type: vm.type,
-    });
+    // Step 8-9: Resolve signing key
+    addStep("Resolve Signing Key", "pending", { keyid: sigParams.keyid });
+    let jwk: EcPublicJwk;
 
-    // Step 9: Extract the JWK public key
-    addStep("Extract Public Key", "pending");
-    const jwk = extractPublicKey(vm);
-    addStep("Extract Public Key", "success", {
-      keyType: jwk.kty,
-      curve: jwk.crv,
-    });
+    if (sigParams.keyid?.startsWith("did:key:")) {
+      // Resolve did:key directly to JWK
+      jwk = resolveDidKey(sigParams.keyid);
+      addStep("Resolve Signing Key", "success", {
+        source: "did:key",
+        keyType: jwk.kty,
+        curve: jwk.crv,
+      });
+
+      // Check if the DID document contains the signing key (informational)
+      addStep("Match Key in DID Document", "pending");
+      let matchedVm = await findVerificationMethodByThumbprint(didDoc, jwk);
+      if (!matchedVm) {
+        // Try matching via publicKeyMultibase-extracted keys
+        for (const vm of didDoc.verificationMethod ?? []) {
+          if (!vm.publicKeyMultibase) continue;
+          try {
+            const vmJwk = extractPublicKey(vm);
+            const vmThumb = await computeJwkThumbprint(vmJwk);
+            const keyThumb = await computeJwkThumbprint(jwk);
+            if (vmThumb === keyThumb) {
+              matchedVm = vm;
+              break;
+            }
+          } catch { continue; }
+        }
+      }
+      if (matchedVm) {
+        addStep("Match Key in DID Document", "success", { methodId: matchedVm.id });
+      } else {
+        // Not a verification failure — the did:key is self-authenticating
+        addStep("Match Key in DID Document", "success", {
+          keyid: sigParams.keyid,
+          note: "Signing key not in DID document (did:key is self-authenticating)",
+          availableMethods: didDoc.verificationMethod?.map((v) => v.id) ?? [],
+        });
+      }
+    } else {
+      // Original path: find VM by id match
+      const vm = findVerificationMethod(didDoc, sigParams.keyid ?? "");
+      if (!vm) {
+        addStep("Resolve Signing Key", "failed", {
+          keyid: sigParams.keyid,
+          availableMethods: didDoc.verificationMethod?.map((v) => v.id) ?? [],
+        });
+        result.errors.push(`Verification method not found: ${sigParams.keyid}`);
+        return result;
+      }
+      jwk = extractPublicKey(vm);
+      addStep("Resolve Signing Key", "success", {
+        methodId: vm.id,
+        type: vm.type,
+        keyType: jwk.kty,
+        curve: jwk.crv,
+      });
+    }
 
     // Step 10: Build the signature base string
     addStep("Build Signature Base", "pending");
