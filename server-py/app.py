@@ -9,11 +9,81 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 from flask import Flask, Response
 
 
+_B58_ALPHABET_STR = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_DECODE_MAP = {c: i for i, c in enumerate(_B58_ALPHABET_STR)}
+
+
+def _base58btc_decode(s: str) -> bytes:
+    """Decode a base58btc (Bitcoin alphabet) string to bytes."""
+    n = 0
+    for c in s:
+        if c not in _B58_DECODE_MAP:
+            raise ValueError(f"Invalid base58 character: {c!r}")
+        n = n * 58 + _B58_DECODE_MAP[c]
+    # Preserve leading zero bytes (encoded as '1')
+    leading_ones = 0
+    for c in s:
+        if c == "1":
+            leading_ones += 1
+        else:
+            break
+    if n == 0:
+        return b"\x00" * leading_ones
+    result = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return b"\x00" * leading_ones + result
+
+
+def _load_from_did_key(did_key_str: str) -> ec.EllipticCurvePrivateKey:
+    """Load a P-256 private key from a did:key: string."""
+    value = did_key_str.removeprefix("did:key:")
+    if not value.startswith("z"):
+        raise RuntimeError("did:key value must use multibase base58btc encoding (z prefix)")
+    decoded = _base58btc_decode(value[1:])
+    if len(decoded) < 2:
+        raise RuntimeError("did:key value too short")
+    prefix = decoded[:2]
+    key_bytes = decoded[2:]
+    # P-256 private key multicodec prefix: 0x86 0x26
+    if prefix == b"\x86\x26":
+        private_value = int.from_bytes(key_bytes, "big")
+        return ec.derive_private_key(private_value, ec.SECP256R1())
+    # P-256 public key multicodec prefix: 0x80 0x24
+    if prefix == b"\x80\x24":
+        raise RuntimeError(
+            "did:key contains a P-256 public key, not a private key. "
+            "A private key (multicodec prefix 0x8626) is required for signing."
+        )
+    raise RuntimeError(
+        f"Unsupported did:key multicodec prefix: {prefix.hex()}. "
+        "Only P-256 private keys (prefix 0x8626) are supported."
+    )
+
+
+def _load_from_jwk(jwk_str: str) -> ec.EllipticCurvePrivateKey:
+    """Load a P-256 private key from a JWK JSON string."""
+    jwk_data = json.loads(jwk_str)
+    if jwk_data.get("kty") != "EC":
+        raise RuntimeError(f"JWK kty must be 'EC', got '{jwk_data.get('kty')}'")
+    if jwk_data.get("crv") != "P-256":
+        raise RuntimeError(f"JWK crv must be 'P-256', got '{jwk_data.get('crv')}'")
+    if "d" not in jwk_data:
+        raise RuntimeError("JWK is missing 'd' parameter (private key scalar)")
+    d_bytes = base64.urlsafe_b64decode(jwk_data["d"] + "==")
+    private_value = int.from_bytes(d_bytes, "big")
+    return ec.derive_private_key(private_value, ec.SECP256R1())
+
+
 def load_private_key():
-    pem_data = os.environ.get("HTTPSIG_PRIVATE_KEY")
-    if not pem_data:
+    key_data = os.environ.get("HTTPSIG_PRIVATE_KEY")
+    if not key_data:
         raise RuntimeError("HTTPSIG_PRIVATE_KEY environment variable is required")
-    key = serialization.load_pem_private_key(pem_data.encode(), password=None)
+    key_data = key_data.strip()
+    if key_data.startswith("did:key:"):
+        return _load_from_did_key(key_data)
+    if key_data.startswith("{"):
+        return _load_from_jwk(key_data)
+    # Fall back to PEM
+    key = serialization.load_pem_private_key(key_data.encode(), password=None)
     if not isinstance(key, ec.EllipticCurvePrivateKey):
         raise RuntimeError("Key must be an ECDSA private key")
     if not isinstance(key.curve, ec.SECP256R1):
@@ -90,19 +160,16 @@ def public_key_multibase(private_key):
 
 
 def did_key_id(private_key):
-    """Derive a did:key identifier and JWK thumbprint fragment for the public key.
+    """Derive a did:key identifier and verification method ID for the public key.
 
     Returns (did_key, key_id) where:
       - did_key is e.g. "did:key:zDn..."
-      - key_id is "did:key:zDn...#<jwk-thumbprint>"
+      - key_id is "did:key:zDn...#zDn..." (fragment is the multibase value per the did:key spec)
     """
     multibase = public_key_multibase(private_key)
     did_key = "did:key:" + multibase
 
-    jwk = public_key_jwk(private_key)
-    thumbprint = jwk_thumbprint(jwk)
-
-    return did_key, f"{did_key}#{thumbprint}"
+    return did_key, f"{did_key}#{multibase}"
 
 
 def build_signature_base(status, content_type, covered, key_id, created):
@@ -151,8 +218,11 @@ def create_app(private_key=None):
     covered = ["@status", "content-type"]
 
     did = f"did:web:{domain}"
-    _did_key, key_id = did_key_id(private_key)
+    did_key, _key_id = did_key_id(private_key)
     multibase = public_key_multibase(private_key)
+    vm_id = f"{did}#atproto"
+
+    controller = os.environ.get("SERVICE_CONTROLLER")
 
     did_document = {
         "@context": [
@@ -160,17 +230,28 @@ def create_app(private_key=None):
             "https://w3id.org/security/multikey/v1",
         ],
         "id": did,
+        **({"controller": controller} if controller else {}),
+        "alsoKnownAs": [],
         "verificationMethod": [
             {
-                "id": key_id,
+                "id": vm_id,
                 "type": "Multikey",
                 "controller": did,
                 "publicKeyMultibase": multibase,
             }
         ],
-        "authentication": [key_id],
-        "assertionMethod": [key_id],
+        "service": [
+            {
+                "id": "#attestation",
+                "type": "DomainAttestationService",
+                "serviceEndpoint": f"https://{domain}",
+            }
+        ],
     }
+
+    @app.after_request
+    def add_signature(response):
+        return sign_response(response, private_key, vm_id, covered)
 
     @app.route("/")
     def home():
@@ -185,8 +266,7 @@ def create_app(private_key=None):
     @app.route("/.well-known/did.json")
     def did_json():
         body = json.dumps(did_document, indent=2)
-        response = Response(body, status=200, content_type="application/json")
-        return sign_response(response, private_key, key_id, covered)
+        return Response(body, status=200, content_type="application/json")
 
     return app
 
