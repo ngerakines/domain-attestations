@@ -1,0 +1,20 @@
+services:
+  web-app:
+    build:
+      context: ../server-py
+      dockerfile: ../demo-service/Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - HTTPSIG_PRIVATE_KEY=${HTTPSIG_PRIVATE_KEY}
+      - SERVER_DOMAIN=${SERVER_DOMAIN:-localhost}
+      - SERVICE_CONTROLLER=${SERVICE_CONTROLLER}
+
+  tor:
+    image: jakejarvis/tor:latest
+    restart: unless-stopped
+    volumes:
+      - ./tor-data:/var/lib/tor/
+      - ./torrc:/etc/tor/torrc:ro
+    depends_on:
+      - web-app
