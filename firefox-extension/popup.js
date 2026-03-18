@@ -274,8 +274,13 @@
       console.error("[Popup] Error clearing history:", error);
     }
   });
+  var BUILD_ID = typeof __BUILD_ID__ !== "undefined" ? __BUILD_ID__ : "dev";
   document.addEventListener("DOMContentLoaded", () => {
     displayCurrentResult();
+    const buildEl = document.getElementById("build-id");
+    if (buildEl) {
+      buildEl.textContent = `Build: ${BUILD_ID}`;
+    }
   });
   browser.runtime.onMessage.addListener((message) => {
     if (message.type === "verification-updated") {

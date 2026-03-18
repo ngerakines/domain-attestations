@@ -111,7 +111,9 @@ const ICONS: Record<string, IconPaths> = {
   },
 };
 
-console.log("[HTTP Sig] Extension initialized");
+declare const __BUILD_ID__: string;
+const BUILD_ID = typeof __BUILD_ID__ !== "undefined" ? __BUILD_ID__ : "dev";
+console.log(`[HTTP Sig] Extension initialized (build: ${BUILD_ID})`);
 
 // ── did:key Resolution ────────────────────────────────────────────
 
@@ -472,6 +474,10 @@ async function verifyEcdsaSignature(
       );
     }
 
+    console.log("[HTTP Sig] JWK for verification:", JSON.stringify({ kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y }));
+    console.log("[HTTP Sig] Raw signature (P1363, hex):", Array.from(rawSignature).map(b => b.toString(16).padStart(2, '0')).join(''));
+    console.log("[HTTP Sig] Raw signature length:", rawSignature.length);
+
     const publicKey = await crypto.subtle.importKey(
       "jwk",
       { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y },
@@ -481,13 +487,16 @@ async function verifyEcdsaSignature(
     );
 
     const messageBytes = new TextEncoder().encode(message);
+    console.log("[HTTP Sig] Message to verify length:", messageBytes.length);
 
-    return await crypto.subtle.verify(
+    const result = await crypto.subtle.verify(
       { name: "ECDSA", hash: { name: "SHA-256" } },
       publicKey,
       rawSignature.buffer as ArrayBuffer,
       messageBytes,
     );
+    console.log("[HTTP Sig] crypto.subtle.verify result:", result);
+    return result;
   } catch (error) {
     console.error("[HTTP Sig] ECDSA verification error:", error);
     return false;
@@ -535,10 +544,14 @@ async function findVerificationMethodByThumbprint(
   const targetThumbprint = await computeJwkThumbprint(referenceJwk);
 
   for (const vm of didDoc.verificationMethod) {
-    if (!vm.publicKeyJwk) continue;
-    const vmThumbprint = await computeJwkThumbprint(vm.publicKeyJwk);
-    if (vmThumbprint === targetThumbprint) {
-      return vm;
+    try {
+      const vmJwk = extractPublicKey(vm);
+      const vmThumbprint = await computeJwkThumbprint(vmJwk);
+      if (vmThumbprint === targetThumbprint) {
+        return vm;
+      }
+    } catch {
+      continue;
     }
   }
 
@@ -709,6 +722,7 @@ async function performLinkedDidChecks(
   didDoc: DidDocument,
   referenceJwk: EcPublicJwk,
   addStep: (name: string, status: VerificationStep["status"], info?: Record<string, unknown>) => void,
+  extraDids: string[] = [],
 ): Promise<LinkedDidCheck[]> {
   const checks: LinkedDidCheck[] = [];
 
@@ -730,6 +744,13 @@ async function performLinkedDidChecks(
       if (!aka.startsWith("did:")) continue;
       checks.push(await checkLinkedDid(aka, referenceJwk, "alsoKnownAs", addStep));
     }
+  }
+
+  // Check DIDs from ?check= query parameters
+  for (const did of extraDids) {
+    if (!did.startsWith("did:")) continue;
+    if (did === didDoc.id) continue;
+    checks.push(await checkLinkedDid(did, referenceJwk, "alsoKnownAs", addStep));
   }
 
   return checks;
@@ -776,6 +797,8 @@ async function verifyHttpSignature(
         headers[header.name.toLowerCase()] = header.value;
       }
     }
+    console.log("[HTTP Sig] URL:", details.url);
+    console.log("[HTTP Sig] Response headers:", JSON.stringify(headers, null, 2));
     addStep("Extract Headers", "success", {
       headerCount: details.responseHeaders?.length ?? 0,
     });
@@ -847,7 +870,7 @@ async function verifyHttpSignature(
     const url = new URL(details.url);
     const requestInfo: HttpRequestInfo = {
       method: details.method,
-      path: url.pathname + url.search,
+      path: url.pathname,
       authority: url.host,
       origin: url.origin,
     };
@@ -903,12 +926,13 @@ async function verifyHttpSignature(
       if (matchedVm) {
         addStep("Match Key in DID Document", "success", { methodId: matchedVm.id });
       } else {
-        // Not a verification failure — the did:key is self-authenticating
-        addStep("Match Key in DID Document", "success", {
+        addStep("Match Key in DID Document", "failed", {
           keyid: sigParams.keyid,
-          note: "Signing key not in DID document (did:key is self-authenticating)",
+          note: "Signing key not found in DID document",
           availableMethods: didDoc.verificationMethod?.map((v) => v.id) ?? [],
         });
+        result.errors.push(`Signing key ${sigParams.keyid} not found in DID document`);
+        return result;
       }
     } else {
       // Original path: find VM by id match
@@ -949,13 +973,20 @@ async function verifyHttpSignature(
       componentValues,
       sigParamsValue,
     );
+    console.log("[HTTP Sig] Signature base:\n" + signatureBase);
+    console.log("[HTTP Sig] Component values:", JSON.stringify(componentValues, null, 2));
+    console.log("[HTTP Sig] sigParamsValue:", sigParamsValue);
+    console.log("[HTTP Sig] Signature base (hex):", Array.from(new TextEncoder().encode(signatureBase)).map(b => b.toString(16).padStart(2, '0')).join(' '));
     addStep("Build Signature Base", "success", {
       baseLength: signatureBase.length,
       components: sigParams.coveredComponents,
+      signatureBase: signatureBase,
     });
 
     // Step 11: Verify the ECDSA P-256 signature
     addStep("Verify ECDSA P-256 Signature", "pending");
+    console.log("[HTTP Sig] Signature bytes (hex):", Array.from(signature).map(b => b.toString(16).padStart(2, '0')).join(''));
+    console.log("[HTTP Sig] Signature length:", signature.length, "first byte:", signature[0]?.toString(16));
     const isValid = await verifyEcdsaSignature(jwk, signature, signatureBase);
 
     if (isValid) {
@@ -965,10 +996,12 @@ async function verifyHttpSignature(
 
       // Resolve and validate linked DIDs (controller, alsoKnownAs)
       try {
+        const checkDids = url.searchParams.getAll("check");
         const linkedChecks = await performLinkedDidChecks(
           didDoc,
           jwk,
           addStep,
+          checkDids,
         );
         if (linkedChecks.length > 0) {
           result.linkedDidChecks = linkedChecks;

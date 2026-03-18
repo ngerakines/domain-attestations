@@ -360,8 +360,15 @@ document.getElementById("clear-history")!.addEventListener("click", async () => 
 });
 
 // Load current result on open
+declare const __BUILD_ID__: string;
+const BUILD_ID = typeof __BUILD_ID__ !== "undefined" ? __BUILD_ID__ : "dev";
+
 document.addEventListener("DOMContentLoaded", () => {
   displayCurrentResult();
+  const buildEl = document.getElementById("build-id");
+  if (buildEl) {
+    buildEl.textContent = `Build: ${BUILD_ID}`;
+  }
 });
 
 // Refresh when background pushes an update
