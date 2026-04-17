@@ -362,6 +362,36 @@
     }
     return await response.json();
   }
+  async function findKeyInControllers(didDoc, referenceJwk, keyid, addStep) {
+    if (!didDoc.controller)
+      return null;
+    const controllers = Array.isArray(didDoc.controller) ? didDoc.controller : [didDoc.controller];
+    for (const controller of controllers) {
+      if (controller === didDoc.id)
+        continue;
+      if (resolveDidToUrl(controller) === null)
+        continue;
+      try {
+        const controllerDoc = await resolveDidDocument(controller);
+        if (referenceJwk) {
+          const vm = await findVerificationMethodByThumbprint(controllerDoc, referenceJwk);
+          if (vm) {
+            return { jwk: referenceJwk, controllerDid: controller, methodId: vm.id };
+          }
+        }
+        if (keyid) {
+          const vm = findVerificationMethod(controllerDoc, keyid);
+          if (vm) {
+            return { jwk: extractPublicKey(vm), controllerDid: controller, methodId: vm.id };
+          }
+        }
+      } catch (error) {
+        console.log(`[HTTP Sig] Failed to resolve controller ${controller}:`, error);
+        continue;
+      }
+    }
+    return null;
+  }
   async function checkLinkedDid(did, referenceJwk, relationship, addStep) {
     const label = relationship === "controller" ? "Controller" : "alsoKnownAs";
     const stepName = `Resolve ${label}: ${did}`;
@@ -554,31 +584,53 @@
         if (matchedVm) {
           addStep("Match Key in DID Document", "success", { methodId: matchedVm.id });
         } else {
-          addStep("Match Key in DID Document", "failed", {
-            keyid: sigParams.keyid,
-            note: "Signing key not found in DID document",
-            availableMethods: didDoc.verificationMethod?.map((v) => v.id) ?? []
-          });
-          result.errors.push(`Signing key ${sigParams.keyid} not found in DID document`);
-          return result;
+          const controllerResult = await findKeyInControllers(didDoc, jwk, sigParams.keyid, addStep);
+          if (controllerResult) {
+            addStep("Match Key in DID Document", "success", {
+              source: "controller",
+              controllerDid: controllerResult.controllerDid,
+              methodId: controllerResult.methodId
+            });
+          } else {
+            addStep("Match Key in DID Document", "failed", {
+              keyid: sigParams.keyid,
+              note: "Signing key not found in DID document or controller documents",
+              availableMethods: didDoc.verificationMethod?.map((v) => v.id) ?? []
+            });
+            result.errors.push(`Signing key ${sigParams.keyid} not found in DID document or controller documents`);
+            return result;
+          }
         }
       } else {
         const vm = findVerificationMethod(didDoc, sigParams.keyid ?? "");
-        if (!vm) {
-          addStep("Resolve Signing Key", "failed", {
-            keyid: sigParams.keyid,
-            availableMethods: didDoc.verificationMethod?.map((v) => v.id) ?? []
+        if (vm) {
+          jwk = extractPublicKey(vm);
+          addStep("Resolve Signing Key", "success", {
+            methodId: vm.id,
+            type: vm.type,
+            keyType: jwk.kty,
+            curve: jwk.crv
           });
-          result.errors.push(`Verification method not found: ${sigParams.keyid}`);
-          return result;
+        } else {
+          const controllerResult = await findKeyInControllers(didDoc, null, sigParams.keyid, addStep);
+          if (controllerResult) {
+            jwk = controllerResult.jwk;
+            addStep("Resolve Signing Key", "success", {
+              source: "controller",
+              controllerDid: controllerResult.controllerDid,
+              methodId: controllerResult.methodId,
+              keyType: jwk.kty,
+              curve: jwk.crv
+            });
+          } else {
+            addStep("Resolve Signing Key", "failed", {
+              keyid: sigParams.keyid,
+              availableMethods: didDoc.verificationMethod?.map((v) => v.id) ?? []
+            });
+            result.errors.push(`Verification method not found: ${sigParams.keyid}`);
+            return result;
+          }
         }
-        jwk = extractPublicKey(vm);
-        addStep("Resolve Signing Key", "success", {
-          methodId: vm.id,
-          type: vm.type,
-          keyType: jwk.kty,
-          curve: jwk.crv
-        });
       }
       addStep("Build Signature Base", "pending");
       const componentValues = {};
