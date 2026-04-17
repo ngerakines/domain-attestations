@@ -1,13 +1,13 @@
 package httpsig
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
-	"bytes"
 	"fmt"
 	"net/http"
 	"os"
@@ -48,6 +48,11 @@ type HTTPSig struct {
 	// SignatureName is the label for the signature in the Signature
 	// and Signature-Input headers. Defaults to "sig".
 	SignatureName string `json:"signature_name,omitempty"`
+
+	// ATURI, when non-empty, is serialized as the RFC 9421 `tag`
+	// signature parameter (e.g. "at://did:plc:abc/app.bsky.feed.post/xyz").
+	// This binds the signature to a specific AT Protocol resource.
+	ATURI string `json:"at_uri,omitempty"`
 
 	key    *ecdsa.PrivateKey
 	logger *zap.Logger
@@ -176,6 +181,9 @@ func (h *HTTPSig) buildSignatureBase(status int, header http.Header, r *http.Req
 	}
 	sigParams := fmt.Sprintf("(%s);created=%d;keyid=%q;alg=%q",
 		strings.Join(parts, " "), created, h.KeyID, "ecdsa-p256-sha256")
+	if h.ATURI != "" {
+		sigParams += fmt.Sprintf(";tag=%q", h.ATURI)
+	}
 
 	lines = append(lines, fmt.Sprintf("%q: %s", "@signature-params", sigParams))
 
@@ -240,6 +248,7 @@ func parseECDSAPrivateKey(pemData []byte) (*ecdsa.PrivateKey, error) {
 //	    key_id <id>
 //	    covered <component1> [<component2> ...]
 //	    signature_name <name>
+//	    at_uri <at-uri>
 //	}
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var hs HTTPSig
@@ -265,6 +274,10 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				}
 			case "signature_name":
 				if !h.Args(&hs.SignatureName) {
+					return nil, h.ArgErr()
+				}
+			case "at_uri":
+				if !h.Args(&hs.ATURI) {
 					return nil, h.ArgErr()
 				}
 			default:
