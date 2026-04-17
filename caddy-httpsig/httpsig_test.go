@@ -74,10 +74,10 @@ func TestServeHTTP_SignsResponse(t *testing.T) {
 	key, _ := generateTestKey(t)
 
 	h := &HTTPSig{
-		key:                key,
-		KeyID:              "test-key",
-		SignatureName:      "sig",
-		CoveredComponents:  []string{"@status", "content-type"},
+		key:               key,
+		KeyID:             "test-key",
+		SignatureName:     "sig",
+		CoveredComponents: []string{"@status", "content-type"},
 	}
 
 	inner := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
@@ -127,10 +127,10 @@ func TestServeHTTP_SignatureVerifies(t *testing.T) {
 	key, _ := generateTestKey(t)
 
 	h := &HTTPSig{
-		key:                key,
-		KeyID:              "test-key",
-		SignatureName:      "sig",
-		CoveredComponents:  []string{"@status", "content-type"},
+		key:               key,
+		KeyID:             "test-key",
+		SignatureName:     "sig",
+		CoveredComponents: []string{"@status", "content-type"},
 	}
 
 	inner := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
@@ -182,10 +182,10 @@ func TestBuildSignatureBase(t *testing.T) {
 	key, _ := generateTestKey(t)
 
 	h := &HTTPSig{
-		key:                key,
-		KeyID:              "test-key",
-		SignatureName:      "sig",
-		CoveredComponents:  []string{"@status", "content-type"},
+		key:               key,
+		KeyID:             "test-key",
+		SignatureName:     "sig",
+		CoveredComponents: []string{"@status", "content-type"},
 	}
 
 	header := http.Header{}
@@ -209,6 +209,93 @@ func TestBuildSignatureBase(t *testing.T) {
 	}
 	if !strings.Contains(params, "created=1700000000") {
 		t.Errorf("params should contain created timestamp, got: %s", params)
+	}
+}
+
+func TestBuildSignatureBase_WithATURI(t *testing.T) {
+	key, _ := generateTestKey(t)
+
+	atURI := "at://did:plc:abc/app.bsky.feed.post/rkey"
+	h := &HTTPSig{
+		key:               key,
+		KeyID:             "test-key",
+		SignatureName:     "sig",
+		CoveredComponents: []string{"@status", "content-type"},
+		ATURI:             atURI,
+	}
+
+	header := http.Header{}
+	header.Set("Content-Type", "application/json")
+
+	req := httptest.NewRequest("GET", "http://example.com/test", nil)
+
+	base, params, err := h.buildSignatureBase(200, header, req, 1700000000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := `tag="` + atURI + `"`
+	if !strings.Contains(params, want) {
+		t.Errorf("params should contain %s, got: %s", want, params)
+	}
+	if !strings.Contains(base, want) {
+		t.Errorf("signature base should contain %s in @signature-params, got:\n%s", want, base)
+	}
+}
+
+func TestServeHTTP_SignatureVerifiesWithATURI(t *testing.T) {
+	key, _ := generateTestKey(t)
+
+	atURI := "at://did:plc:abc/app.bsky.feed.post/rkey"
+	h := &HTTPSig{
+		key:               key,
+		KeyID:             "test-key",
+		SignatureName:     "sig",
+		CoveredComponents: []string{"@status", "content-type"},
+		ATURI:             atURI,
+	}
+
+	inner := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"hello":"world"}`))
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "http://example.com/.well-known/did.json", nil)
+	rec := httptest.NewRecorder()
+
+	if err := h.ServeHTTP(rec, req, inner); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resp := rec.Result()
+
+	sigInput := resp.Header.Get("Signature-Input")
+	if !strings.Contains(sigInput, `tag="`+atURI+`"`) {
+		t.Fatalf("Signature-Input should contain tag param, got: %s", sigInput)
+	}
+
+	sigHeader := resp.Header.Get("Signature")
+	sigB64 := strings.TrimPrefix(sigHeader, "sig=:")
+	sigB64 = strings.TrimSuffix(sigB64, ":")
+	sigBytes, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		t.Fatalf("decoding signature: %v", err)
+	}
+
+	sigParams := strings.TrimPrefix(sigInput, "sig=")
+
+	lines := []string{
+		`"@status": 200`,
+		`"content-type": application/json`,
+		`"@signature-params": ` + sigParams,
+	}
+	sigBase := strings.Join(lines, "\n")
+
+	digest := sha256.Sum256([]byte(sigBase))
+	if !ecdsa.VerifyASN1(&key.PublicKey, digest[:], sigBytes) {
+		t.Fatal("signature verification failed")
 	}
 }
 

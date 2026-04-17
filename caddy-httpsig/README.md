@@ -55,6 +55,7 @@ make build
 | `key_id`         | Identifier included in the `Signature-Input` header's `keyid` parameter.    | `default`                  |
 | `covered`        | Space-separated list of response components to sign.                        | `@status content-type`     |
 | `signature_name` | Label for the signature in the `Signature` and `Signature-Input` headers.   | `sig`                      |
+| `at_uri`         | AT-URI bound to the signature, emitted as the RFC 9421 `tag` parameter.     | _(none)_                   |
 
 One of `key_file` or `key_env` is required. Both accept PEM-encoded keys in either SEC 1 (`EC PRIVATE KEY`) or PKCS#8 (`PRIVATE KEY`) format.
 
@@ -67,6 +68,29 @@ The `covered` directive accepts any combination of:
 - `@path` -- the request path (derived from the request)
 - `@authority` -- the request host (derived from the request)
 - Any response header name (e.g. `content-type`, `content-digest`)
+
+### AT-URI tag
+
+When `at_uri` is set, its value is included in the signature params as the
+RFC 9421 `tag` parameter, binding the signature to a specific AT Protocol
+resource:
+
+```
+httpsig {
+    key_file /path/to/key.pem
+    key_id did:key:z...
+    at_uri at://did:plc:example/app.bsky.feed.post/abc123
+}
+```
+
+Produces:
+
+```
+Signature-Input: sig=("@status" "content-type");created=1700000000;keyid="did:key:z...";alg="ecdsa-p256-sha256";tag="at://did:plc:example/app.bsky.feed.post/abc123"
+```
+
+Because the `tag` parameter is part of `@signature-params`, it is covered by
+the signature and cannot be altered without invalidating it.
 
 ## Generating a key
 
