@@ -18,6 +18,7 @@ interface LinkedDidCheck {
   status: "success" | "failed" | "skipped";
   error?: string;
   keyFound?: boolean;
+  reciprocal?: boolean;
 }
 
 interface VerificationResult {
@@ -130,6 +131,9 @@ function renderLinkedDidChecks(checks: LinkedDidCheck[]): string {
     let detailsHtml = "";
     if (check.keyFound !== undefined) {
       detailsHtml += `Key found: ${check.keyFound}<br>`;
+    }
+    if (check.relationship === "alsoKnownAs" && check.reciprocal !== undefined) {
+      detailsHtml += `Reciprocal: ${check.reciprocal}<br>`;
     }
     if (check.error) {
       detailsHtml += escapeHtml(check.error);

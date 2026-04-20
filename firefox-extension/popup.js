@@ -83,6 +83,9 @@
       if (check.keyFound !== void 0) {
         detailsHtml += `Key found: ${check.keyFound}<br>`;
       }
+      if (check.relationship === "alsoKnownAs" && check.reciprocal !== void 0) {
+        detailsHtml += `Reciprocal: ${check.reciprocal}<br>`;
+      }
       if (check.error) {
         detailsHtml += escapeHtml(check.error);
       }
