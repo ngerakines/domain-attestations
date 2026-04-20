@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 
 from app import (
     create_app,
+    build_service_document,
     build_signature_base,
     public_key_jwk,
     public_key_multibase,
@@ -22,21 +23,24 @@ from app import (
 )
 
 
+def _private_key_to_did_key(private_key):
+    private_value = private_key.private_numbers().private_value
+    key_bytes = private_value.to_bytes(32, byteorder="big")
+    multicodec = b"\x86\x26" + key_bytes
+    return "did:key:z" + _base58btc_encode(multicodec)
+
+
 @pytest.fixture
 def key_pair():
     private_key = ec.generate_private_key(ec.SECP256R1())
-    pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    return private_key, pem
+    did_key_str = _private_key_to_did_key(private_key)
+    return private_key, did_key_str
 
 
 @pytest.fixture
 def client(key_pair):
-    private_key, pem = key_pair
-    os.environ["HTTPSIG_PRIVATE_KEY"] = pem.decode()
+    private_key, did_key_str = key_pair
+    os.environ["HTTPSIG_PRIVATE_KEY"] = did_key_str
     os.environ["SERVER_DOMAIN"] = "example.com"
     app = create_app(private_key=private_key)
     app.config["TESTING"] = True
@@ -86,8 +90,8 @@ def test_did_document_structure(client, key_pair):
 
 def test_did_document_with_controller(key_pair):
     """SERVICE_CONTROLLER env var adds controller to the DID document."""
-    private_key, pem = key_pair
-    os.environ["HTTPSIG_PRIVATE_KEY"] = pem.decode()
+    private_key, did_key_str = key_pair
+    os.environ["HTTPSIG_PRIVATE_KEY"] = did_key_str
     os.environ["SERVER_DOMAIN"] = "example.com"
     os.environ["SERVICE_CONTROLLER"] = "did:plc:abc123"
     app = create_app(private_key=private_key)
@@ -97,6 +101,79 @@ def test_did_document_with_controller(key_pair):
         doc = json.loads(resp.data)
         assert doc["controller"] == "did:plc:abc123"
     os.environ.pop("SERVICE_CONTROLLER", None)
+
+
+def test_did_document_with_also_known_as(key_pair):
+    """SERVICE_ALSO_KNOWN_AS env var populates alsoKnownAs as a comma-separated list."""
+    private_key, did_key_str = key_pair
+    os.environ["HTTPSIG_PRIVATE_KEY"] = did_key_str
+    os.environ["SERVER_DOMAIN"] = "example.com"
+    os.environ["SERVICE_ALSO_KNOWN_AS"] = "did:plc:abc,at://foo.example"
+    app = create_app(private_key=private_key)
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        resp = client.get("/.well-known/did.json")
+        doc = json.loads(resp.data)
+        assert doc["alsoKnownAs"] == ["did:plc:abc", "at://foo.example"]
+    os.environ.pop("SERVICE_ALSO_KNOWN_AS", None)
+
+
+def test_also_known_as_strips_whitespace_and_empties(key_pair):
+    """Whitespace around entries is stripped; empty segments are dropped."""
+    private_key, did_key_str = key_pair
+    os.environ["HTTPSIG_PRIVATE_KEY"] = did_key_str
+    os.environ["SERVER_DOMAIN"] = "example.com"
+    os.environ["SERVICE_ALSO_KNOWN_AS"] = " did:plc:abc , , did:plc:xyz "
+    app = create_app(private_key=private_key)
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        resp = client.get("/.well-known/did.json")
+        doc = json.loads(resp.data)
+        assert doc["alsoKnownAs"] == ["did:plc:abc", "did:plc:xyz"]
+    os.environ.pop("SERVICE_ALSO_KNOWN_AS", None)
+
+
+def test_also_known_as_empty_env_var(key_pair):
+    """Unset or empty SERVICE_ALSO_KNOWN_AS yields an empty list."""
+    private_key, did_key_str = key_pair
+    os.environ["HTTPSIG_PRIVATE_KEY"] = did_key_str
+    os.environ["SERVER_DOMAIN"] = "example.com"
+    os.environ["SERVICE_ALSO_KNOWN_AS"] = ""
+    app = create_app(private_key=private_key)
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        resp = client.get("/.well-known/did.json")
+        doc = json.loads(resp.data)
+        assert doc["alsoKnownAs"] == []
+    os.environ.pop("SERVICE_ALSO_KNOWN_AS", None)
+
+
+def test_build_service_document_unit():
+    """Direct unit test of build_service_document covering all parameter variants."""
+    multibase = "zDnStubValue"
+
+    # Minimal: no controller, no alsoKnownAs
+    doc = build_service_document("example.com", multibase)
+    assert doc["id"] == "did:web:example.com"
+    assert "controller" not in doc
+    assert doc["alsoKnownAs"] == []
+    assert doc["verificationMethod"][0]["publicKeyMultibase"] == multibase
+    assert doc["verificationMethod"][0]["id"] == "did:web:example.com#atproto"
+    assert doc["service"][0]["serviceEndpoint"] == "https://example.com"
+
+    # With controller
+    doc = build_service_document("example.com", multibase, controller="did:plc:ctrl")
+    assert doc["controller"] == "did:plc:ctrl"
+
+    # With alsoKnownAs
+    doc = build_service_document(
+        "example.com", multibase, also_known_as=["did:plc:a", "at://b.example"]
+    )
+    assert doc["alsoKnownAs"] == ["did:plc:a", "at://b.example"]
+
+    # None for also_known_as yields empty list
+    doc = build_service_document("example.com", multibase, also_known_as=None)
+    assert doc["alsoKnownAs"] == []
 
 
 def test_signature_headers_present(client, key_pair):
@@ -200,6 +277,22 @@ def test_missing_key_env_var():
     os.environ.pop("HTTPSIG_PRIVATE_KEY", None)
     with pytest.raises(RuntimeError, match="HTTPSIG_PRIVATE_KEY"):
         create_app()
+
+
+def test_load_private_key_rejects_pem(key_pair):
+    """PEM input is no longer accepted — only did:key: and JWK."""
+    private_key, _ = key_pair
+    pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    os.environ["HTTPSIG_PRIVATE_KEY"] = pem
+    try:
+        with pytest.raises(RuntimeError, match="did:key: string or a JWK JSON object"):
+            load_private_key()
+    finally:
+        os.environ.pop("HTTPSIG_PRIVATE_KEY", None)
 
 
 def test_load_private_key_from_did_key(key_pair):
