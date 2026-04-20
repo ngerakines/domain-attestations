@@ -10,11 +10,16 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Generate a key
+## Provide a key
+
+`HTTPSIG_PRIVATE_KEY` accepts either a `did:key:` string (multibase P-256 private key) or a JWK JSON object. PEM is not supported.
 
 ```sh
-openssl ecparam -name prime256v1 -genkey -noout -out key.pem
-export HTTPSIG_PRIVATE_KEY="$(cat key.pem)"
+# did:key form (preferred)
+export HTTPSIG_PRIVATE_KEY="did:key:z..."
+
+# JWK form
+export HTTPSIG_PRIVATE_KEY='{"kty":"EC","crv":"P-256","x":"...","y":"...","d":"..."}'
 ```
 
 ## Run
@@ -28,8 +33,10 @@ flask --app app run
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `HTTPSIG_PRIVATE_KEY` | Yes | — | PEM-encoded ECDSA P-256 private key |
+| `HTTPSIG_PRIVATE_KEY` | Yes | — | `did:key:` string or JWK JSON object (P-256) |
 | `SERVER_DOMAIN` | No | `localhost:5000` | Domain for the `did:web` DID document |
+| `SERVICE_CONTROLLER` | No | — | Optional DID to set as the document's top-level `controller` |
+| `SERVICE_ALSO_KNOWN_AS` | No | — | Optional comma-separated list of values for the document's `alsoKnownAs` array |
 
 The `keyid` in the `Signature-Input` header is derived automatically from the public key using `did:key` encoding with an RFC 7638 JWK Thumbprint fragment (e.g. `did:key:zDn...#<thumbprint>`).
 

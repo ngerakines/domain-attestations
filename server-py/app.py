@@ -82,13 +82,9 @@ def load_private_key():
         return _load_from_did_key(key_data)
     if key_data.startswith("{"):
         return _load_from_jwk(key_data)
-    # Fall back to PEM
-    key = serialization.load_pem_private_key(key_data.encode(), password=None)
-    if not isinstance(key, ec.EllipticCurvePrivateKey):
-        raise RuntimeError("Key must be an ECDSA private key")
-    if not isinstance(key.curve, ec.SECP256R1):
-        raise RuntimeError("Key must use the P-256 curve")
-    return key
+    raise RuntimeError(
+        "HTTPSIG_PRIVATE_KEY must be a did:key: string or a JWK JSON object"
+    )
 
 
 def public_key_jwk(private_key):
@@ -208,30 +204,18 @@ def sign_response(response, private_key, key_id, covered):
     return response
 
 
-def create_app(private_key=None):
-    app = Flask(__name__)
-
-    if private_key is None:
-        private_key = load_private_key()
-
-    domain = os.environ.get("SERVER_DOMAIN", "localhost:5000")
-    covered = ["@status", "content-type"]
-
+def build_service_document(domain, multibase, controller=None, also_known_as=None):
+    """Return the DID document dict for did:web:{domain}."""
     did = f"did:web:{domain}"
-    did_key, _key_id = did_key_id(private_key)
-    multibase = public_key_multibase(private_key)
-    vm_id = f"{did}#atproto"
-
-    controller = os.environ.get("SERVICE_CONTROLLER")
-
-    did_document = {
+    vm_id = f"{did}#sign"
+    return {
         "@context": [
             "https://www.w3.org/ns/did/v1",
             "https://w3id.org/security/multikey/v1",
         ],
         "id": did,
         **({"controller": controller} if controller else {}),
-        "alsoKnownAs": [],
+        "alsoKnownAs": list(also_known_as) if also_known_as else [],
         "verificationMethod": [
             {
                 "id": vm_id,
@@ -248,6 +232,36 @@ def create_app(private_key=None):
             }
         ],
     }
+
+
+def _parse_also_known_as(raw):
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def create_app(private_key=None):
+    app = Flask(__name__)
+
+    if private_key is None:
+        private_key = load_private_key()
+
+    domain = os.environ.get("SERVER_DOMAIN", "localhost:5000")
+    covered = ["@status", "content-type"]
+
+    did = f"did:web:{domain}"
+    multibase = public_key_multibase(private_key)
+    vm_id = f"{did}#atproto"
+
+    controller = os.environ.get("SERVICE_CONTROLLER")
+    also_known_as = _parse_also_known_as(os.environ.get("SERVICE_ALSO_KNOWN_AS"))
+
+    did_document = build_service_document(
+        domain,
+        multibase,
+        controller=controller,
+        also_known_as=also_known_as,
+    )
 
     @app.after_request
     def add_signature(response):
