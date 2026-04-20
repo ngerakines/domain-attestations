@@ -84,6 +84,9 @@ interface LinkedDidCheck {
   status: "success" | "failed" | "skipped";
   error?: string;
   keyFound?: boolean;
+  // Only populated for alsoKnownAs: whether the linked DID document lists
+  // the origin DID in its own alsoKnownAs (mutual-identity assertion).
+  reciprocal?: boolean;
 }
 
 // ── State ──────────────────────────────────────────────────────────
@@ -722,9 +725,16 @@ async function findKeyInControllers(
 /**
  * Resolve a single linked DID and check whether it contains a
  * verification method with the same key (matched by JWK thumbprint).
+ *
+ * For `alsoKnownAs` relationships, additionally verify that the linked
+ * DID document reciprocally lists `originDid` in its own `alsoKnownAs`.
+ * This guards against one-sided mutual-identity claims, where a site
+ * could unilaterally reference a victim DID without the victim claiming
+ * back.
  */
 async function checkLinkedDid(
   did: string,
+  originDid: string,
   referenceJwk: EcPublicJwk,
   relationship: "controller" | "alsoKnownAs",
   addStep: (name: string, status: VerificationStep["status"], info?: Record<string, unknown>) => void,
@@ -743,15 +753,17 @@ async function checkLinkedDid(
   try {
     const linkedDoc = await resolveDidDocument(did);
     const vm = await findVerificationMethodByThumbprint(linkedDoc, referenceJwk);
+    const keyFound = vm !== undefined;
 
-    if (vm) {
-      addStep(stepName, "success", {
-        did,
-        resolvedId: linkedDoc.id,
-        matchingMethod: vm.id,
-      });
-      return { did, relationship, status: "success", keyFound: true };
-    } else {
+    if (relationship === "controller") {
+      if (keyFound) {
+        addStep(stepName, "success", {
+          did,
+          resolvedId: linkedDoc.id,
+          matchingMethod: vm!.id,
+        });
+        return { did, relationship, status: "success", keyFound: true };
+      }
       addStep(stepName, "failed", {
         did,
         resolvedId: linkedDoc.id,
@@ -759,6 +771,38 @@ async function checkLinkedDid(
       });
       return { did, relationship, status: "failed", keyFound: false, error: "Key not found in linked document" };
     }
+
+    // alsoKnownAs: require both key match AND reciprocal mutual claim.
+    const reciprocal = Array.isArray(linkedDoc.alsoKnownAs)
+      && linkedDoc.alsoKnownAs.includes(originDid);
+
+    if (keyFound && reciprocal) {
+      addStep(stepName, "success", {
+        did,
+        resolvedId: linkedDoc.id,
+        matchingMethod: vm!.id,
+        reciprocal: true,
+      });
+      return { did, relationship, status: "success", keyFound: true, reciprocal: true };
+    }
+
+    let error: string;
+    if (!keyFound && !reciprocal) {
+      error = "Key not found in linked document and linked DID does not claim this DID in alsoKnownAs";
+    } else if (!keyFound) {
+      error = "Key not found in linked document";
+    } else {
+      error = "Key found but linked DID does not claim this DID in alsoKnownAs";
+    }
+
+    addStep(stepName, "failed", {
+      did,
+      resolvedId: linkedDoc.id,
+      keyFound,
+      reciprocal,
+      availableMethods: linkedDoc.verificationMethod?.map((v) => v.id) ?? [],
+    });
+    return { did, relationship, status: "failed", keyFound, reciprocal, error };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     addStep(stepName, "failed", { did, error: message });
@@ -786,7 +830,7 @@ async function performLinkedDidChecks(
 
     for (const controller of controllers) {
       if (controller === didDoc.id) continue;
-      checks.push(await checkLinkedDid(controller, referenceJwk, "controller", addStep));
+      checks.push(await checkLinkedDid(controller, didDoc.id, referenceJwk, "controller", addStep));
     }
   }
 
@@ -794,7 +838,7 @@ async function performLinkedDidChecks(
   if (didDoc.alsoKnownAs) {
     for (const aka of didDoc.alsoKnownAs) {
       if (!aka.startsWith("did:")) continue;
-      checks.push(await checkLinkedDid(aka, referenceJwk, "alsoKnownAs", addStep));
+      checks.push(await checkLinkedDid(aka, didDoc.id, referenceJwk, "alsoKnownAs", addStep));
     }
   }
 
@@ -802,7 +846,7 @@ async function performLinkedDidChecks(
   for (const did of extraDids) {
     if (!did.startsWith("did:")) continue;
     if (did === didDoc.id) continue;
-    checks.push(await checkLinkedDid(did, referenceJwk, "alsoKnownAs", addStep));
+    checks.push(await checkLinkedDid(did, didDoc.id, referenceJwk, "alsoKnownAs", addStep));
   }
 
   return checks;

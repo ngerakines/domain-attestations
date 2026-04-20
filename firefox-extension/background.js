@@ -392,7 +392,7 @@
     }
     return null;
   }
-  async function checkLinkedDid(did, referenceJwk, relationship, addStep) {
+  async function checkLinkedDid(did, originDid, referenceJwk, relationship, addStep) {
     const label = relationship === "controller" ? "Controller" : "alsoKnownAs";
     const stepName = `Resolve ${label}: ${did}`;
     if (resolveDidToUrl(did) === null) {
@@ -403,14 +403,16 @@
     try {
       const linkedDoc = await resolveDidDocument(did);
       const vm = await findVerificationMethodByThumbprint(linkedDoc, referenceJwk);
-      if (vm) {
-        addStep(stepName, "success", {
-          did,
-          resolvedId: linkedDoc.id,
-          matchingMethod: vm.id
-        });
-        return { did, relationship, status: "success", keyFound: true };
-      } else {
+      const keyFound = vm !== void 0;
+      if (relationship === "controller") {
+        if (keyFound) {
+          addStep(stepName, "success", {
+            did,
+            resolvedId: linkedDoc.id,
+            matchingMethod: vm.id
+          });
+          return { did, relationship, status: "success", keyFound: true };
+        }
         addStep(stepName, "failed", {
           did,
           resolvedId: linkedDoc.id,
@@ -418,6 +420,32 @@
         });
         return { did, relationship, status: "failed", keyFound: false, error: "Key not found in linked document" };
       }
+      const reciprocal = Array.isArray(linkedDoc.alsoKnownAs) && linkedDoc.alsoKnownAs.includes(originDid);
+      if (keyFound && reciprocal) {
+        addStep(stepName, "success", {
+          did,
+          resolvedId: linkedDoc.id,
+          matchingMethod: vm.id,
+          reciprocal: true
+        });
+        return { did, relationship, status: "success", keyFound: true, reciprocal: true };
+      }
+      let error;
+      if (!keyFound && !reciprocal) {
+        error = "Key not found in linked document and linked DID does not claim this DID in alsoKnownAs";
+      } else if (!keyFound) {
+        error = "Key not found in linked document";
+      } else {
+        error = "Key found but linked DID does not claim this DID in alsoKnownAs";
+      }
+      addStep(stepName, "failed", {
+        did,
+        resolvedId: linkedDoc.id,
+        keyFound,
+        reciprocal,
+        availableMethods: linkedDoc.verificationMethod?.map((v) => v.id) ?? []
+      });
+      return { did, relationship, status: "failed", keyFound, reciprocal, error };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       addStep(stepName, "failed", { did, error: message });
@@ -431,14 +459,14 @@
       for (const controller of controllers) {
         if (controller === didDoc.id)
           continue;
-        checks.push(await checkLinkedDid(controller, referenceJwk, "controller", addStep));
+        checks.push(await checkLinkedDid(controller, didDoc.id, referenceJwk, "controller", addStep));
       }
     }
     if (didDoc.alsoKnownAs) {
       for (const aka of didDoc.alsoKnownAs) {
         if (!aka.startsWith("did:"))
           continue;
-        checks.push(await checkLinkedDid(aka, referenceJwk, "alsoKnownAs", addStep));
+        checks.push(await checkLinkedDid(aka, didDoc.id, referenceJwk, "alsoKnownAs", addStep));
       }
     }
     for (const did of extraDids) {
@@ -446,7 +474,7 @@
         continue;
       if (did === didDoc.id)
         continue;
-      checks.push(await checkLinkedDid(did, referenceJwk, "alsoKnownAs", addStep));
+      checks.push(await checkLinkedDid(did, didDoc.id, referenceJwk, "alsoKnownAs", addStep));
     }
     return checks;
   }
