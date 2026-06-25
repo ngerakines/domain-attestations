@@ -14,11 +14,31 @@ interface VerificationStep {
 
 interface LinkedDidCheck {
   did: string;
-  relationship: "controller" | "alsoKnownAs";
+  relationship: "controller" | "alsoKnownAs" | "handle";
   status: "success" | "failed" | "skipped";
   error?: string;
   keyFound?: boolean;
   reciprocal?: boolean;
+  handle?: string;
+  resolvedDid?: string;
+  resolvedVia?: "http";
+  matchesOrigin?: boolean;
+}
+
+interface DomainAnchorChainMember {
+  did: string;
+  host: string | null;
+  holdsKey: boolean;
+  reciprocal: boolean;
+}
+
+interface DomainAnchorResult {
+  originHost: string;
+  keyDid: string | null;
+  anchored: boolean;
+  via: "direct" | "chain" | "none";
+  chain: DomainAnchorChainMember[];
+  error?: string;
 }
 
 interface VerificationResult {
@@ -30,6 +50,7 @@ interface VerificationResult {
   steps: VerificationStep[];
   duration?: number;
   linkedDidChecks?: LinkedDidCheck[];
+  domainAnchoring?: DomainAnchorResult;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -107,6 +128,7 @@ function renderHistoryDetails(item: VerificationResult): string {
     html += "</div>";
   }
 
+  html += renderDomainAnchoring(item.domainAnchoring);
   html += renderLinkedDidChecks(item.linkedDidChecks ?? []);
 
   return html;
@@ -126,29 +148,86 @@ function renderLinkedDidChecks(checks: LinkedDidCheck[]): string {
     };
     const icon = iconMap[check.status] ?? "\u2022";
     const statusClass = check.status === "skipped" ? "pending" : check.status;
-    const label = check.relationship === "controller" ? "Controller" : "alsoKnownAs";
+    const labelMap: Record<LinkedDidCheck["relationship"], string> = {
+      controller: "Controller",
+      alsoKnownAs: "alsoKnownAs",
+      handle: "Handle",
+    };
+    const label = labelMap[check.relationship];
 
     let detailsHtml = "";
-    if (check.keyFound !== undefined) {
-      detailsHtml += `Key found: ${check.keyFound}<br>`;
-    }
-    if (check.relationship === "alsoKnownAs" && check.reciprocal !== undefined) {
-      detailsHtml += `Reciprocal: ${check.reciprocal}<br>`;
+    if (check.relationship === "handle") {
+      if (check.resolvedDid) {
+        detailsHtml += `Resolves to: ${escapeHtml(check.resolvedDid)}<br>`;
+      }
+      if (check.matchesOrigin !== undefined) {
+        detailsHtml += `Matches origin DID: ${check.matchesOrigin}<br>`;
+      }
+    } else {
+      if (check.keyFound !== undefined) {
+        detailsHtml += `Key found: ${check.keyFound}<br>`;
+      }
+      if (check.relationship === "alsoKnownAs" && check.reciprocal !== undefined) {
+        detailsHtml += `Reciprocal: ${check.reciprocal}<br>`;
+      }
     }
     if (check.error) {
       detailsHtml += escapeHtml(check.error);
     }
 
+    const title = check.relationship === "handle"
+      ? `${escapeHtml(label)}: at://${escapeHtml(check.handle ?? "")}`
+      : `${escapeHtml(label)}: ${escapeHtml(check.did)}`;
+
     html += `
       <div class="step ${statusClass}">
         <div class="step-icon">${icon}</div>
         <div class="step-content">
-          <div class="step-name">${escapeHtml(label)}: ${escapeHtml(check.did)}</div>
+          <div class="step-name">${title}</div>
           ${detailsHtml ? `<div class="step-details">${detailsHtml}</div>` : ""}
         </div>
       </div>
     `;
   }
+
+  html += "</div></div>";
+  return html;
+}
+
+function renderDomainAnchoring(anchor: DomainAnchorResult | undefined): string {
+  if (!anchor) return "";
+
+  const icon = anchor.anchored ? "✓" : "✗";
+  const statusClass = anchor.anchored ? "success" : "failed";
+  const summary = anchor.anchored
+    ? `Anchored to ${escapeHtml(anchor.originHost)} (${anchor.via})`
+    : `Not anchored to ${escapeHtml(anchor.originHost)}`;
+
+  let html = '<div class="detail-section"><h3>Domain Anchoring</h3>';
+  html += '<div class="step-list">';
+
+  let detailsHtml = "";
+  if (anchor.keyDid) {
+    detailsHtml += `Key DID: ${escapeHtml(anchor.keyDid)}<br>`;
+  }
+  for (const member of anchor.chain) {
+    const memberIcon = member.holdsKey && member.reciprocal ? "✓" : "✗";
+    detailsHtml += `${memberIcon} ${escapeHtml(member.did)} `
+      + `(key: ${member.holdsKey}, reciprocal: ${member.reciprocal})<br>`;
+  }
+  if (anchor.error) {
+    detailsHtml += escapeHtml(anchor.error);
+  }
+
+  html += `
+    <div class="step ${statusClass}">
+      <div class="step-icon">${icon}</div>
+      <div class="step-content">
+        <div class="step-name">${summary}</div>
+        ${detailsHtml ? `<div class="step-details">${detailsHtml}</div>` : ""}
+      </div>
+    </div>
+  `;
 
   html += "</div></div>";
   return html;
@@ -250,6 +329,7 @@ async function displayCurrentResult(): Promise<void> {
     detailsHtml += "</div>";
   }
 
+  detailsHtml += renderDomainAnchoring(result.domainAnchoring);
   detailsHtml += renderLinkedDidChecks(result.linkedDidChecks ?? []);
 
   if (result.duration) {

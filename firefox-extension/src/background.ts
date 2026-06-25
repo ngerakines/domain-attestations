@@ -50,7 +50,15 @@ interface VerificationResult {
   steps: VerificationStep[];
   duration?: number;
   linkedDidChecks?: LinkedDidCheck[];
+  domainAnchoring?: DomainAnchorResult;
 }
+
+/** Convenience signature for the per-step recorder threaded through helpers. */
+type AddStep = (
+  name: string,
+  status: VerificationStep["status"],
+  info?: Record<string, unknown>,
+) => void;
 
 /** Subset of a JWK representing an EC public key. */
 interface EcPublicJwk {
@@ -77,16 +85,45 @@ interface DidDocument {
   verificationMethod?: VerificationMethod[];
 }
 
-/** Result of resolving and checking a linked DID (controller or alsoKnownAs). */
+/** Result of resolving and checking a linked DID (controller or alsoKnownAs) or handle. */
 interface LinkedDidCheck {
   did: string;
-  relationship: "controller" | "alsoKnownAs";
+  relationship: "controller" | "alsoKnownAs" | "handle";
   status: "success" | "failed" | "skipped";
   error?: string;
   keyFound?: boolean;
   // Only populated for alsoKnownAs: whether the linked DID document lists
   // the origin DID in its own alsoKnownAs (mutual-identity assertion).
   reciprocal?: boolean;
+  // Only populated for handle relationships: the at:// handle, the DID it
+  // resolved to, the method used, and whether it points back to the origin DID.
+  handle?: string;
+  resolvedDid?: string;
+  resolvedVia?: "http";
+  matchesOrigin?: boolean;
+}
+
+/** A single member of a verified did:web anchoring chain. */
+interface DomainAnchorChainMember {
+  did: string;
+  host: string | null;
+  holdsKey: boolean;
+  reciprocal: boolean;
+}
+
+/**
+ * Result of checking whether the signing key's identity is bidirectionally
+ * anchored to the request origin domain — either directly (the key's
+ * did:web domain is the origin) or through a chain of mutually-linked,
+ * key-bearing did:web identities.
+ */
+interface DomainAnchorResult {
+  originHost: string;
+  keyDid: string | null;
+  anchored: boolean;
+  via: "direct" | "chain" | "none";
+  chain: DomainAnchorChainMember[];
+  error?: string;
 }
 
 // ── State ──────────────────────────────────────────────────────────
@@ -842,6 +879,16 @@ async function performLinkedDidChecks(
     }
   }
 
+  // Check the first valid at:// handle in alsoKnownAs (bidirectional handle binding)
+  if (didDoc.alsoKnownAs) {
+    for (const aka of didDoc.alsoKnownAs) {
+      const handle = parseAtHandle(aka);
+      if (!handle) continue;
+      checks.push(await checkLinkedHandle(handle, didDoc.id, addStep));
+      break; // only the first valid handle
+    }
+  }
+
   // Check DIDs from ?check= query parameters
   for (const did of extraDids) {
     if (!did.startsWith("did:")) continue;
@@ -850,6 +897,232 @@ async function performLinkedDidChecks(
   }
 
   return checks;
+}
+
+// ── Handle Resolution ──────────────────────────────────────────────
+
+/** TLDs that are not valid public AT Protocol handle suffixes. */
+const RESERVED_HANDLE_TLDS = new Set([
+  "local", "arpa", "internal", "invalid", "localhost", "onion", "example", "alt", "test",
+]);
+
+/**
+ * Parse and validate an `at://<domain>` alsoKnownAs entry as an AT Protocol
+ * handle. Returns the bare lowercase handle, or null if the value is not a
+ * syntactically valid bare handle (e.g. it carries a path, or uses a
+ * reserved/numeric TLD).
+ */
+function parseAtHandle(aka: string): string | null {
+  if (!aka.startsWith("at://")) return null;
+  const rest = aka.slice("at://".length);
+  // A bare handle has no path, query, fragment, or userinfo.
+  if (/[/?#@]/.test(rest)) return null;
+
+  const handle = rest.toLowerCase();
+  if (handle.length === 0 || handle.length > 253) return null;
+
+  const labels = handle.split(".");
+  if (labels.length < 2) return null; // must have at least a domain + TLD
+
+  const labelRe = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+  for (const label of labels) {
+    if (label.length < 1 || label.length > 63) return null;
+    if (!labelRe.test(label)) return null;
+  }
+
+  const tld = labels[labels.length - 1];
+  if (RESERVED_HANDLE_TLDS.has(tld)) return null;
+  if (/^[0-9]+$/.test(tld)) return null; // TLD cannot be all-numeric
+
+  return handle;
+}
+
+/**
+ * Resolve an AT Protocol handle to a DID using the HTTPS well-known method:
+ * `GET https://<handle>/.well-known/atproto-did`, whose body is the DID as
+ * plaintext. (The DNS TXT method is not used: Firefox's dns.resolve cannot
+ * read TXT records, and a DoH fallback would disclose the handle to a
+ * third-party resolver.)
+ */
+async function resolveHandleToDid(handle: string): Promise<string> {
+  const url = `https://${handle}/.well-known/atproto-did`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} from ${url}`);
+    }
+    const body = (await response.text()).trim().split(/\s+/)[0] ?? "";
+    if (!body.startsWith("did:")) {
+      throw new Error(`Response is not a DID: ${body.slice(0, 64)}`);
+    }
+    return body;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Resolve the first valid at:// handle in alsoKnownAs and verify that it
+ * resolves back to the origin DID. Sourcing the handle from the origin DID
+ * document already proves the DID→handle direction; this proves the
+ * handle→DID direction, completing the bidirectional binding.
+ */
+async function checkLinkedHandle(
+  handle: string,
+  originDid: string,
+  addStep: AddStep,
+): Promise<LinkedDidCheck> {
+  const stepName = `Resolve handle: at://${handle}`;
+  addStep(stepName, "pending", { handle });
+
+  try {
+    const resolvedDid = await resolveHandleToDid(handle);
+    const matchesOrigin = resolvedDid === originDid;
+
+    if (matchesOrigin) {
+      addStep(stepName, "success", { handle, resolvedDid });
+      return {
+        did: originDid, relationship: "handle", status: "success",
+        handle, resolvedDid, resolvedVia: "http", matchesOrigin: true,
+      };
+    }
+
+    const error = `Handle resolves to ${resolvedDid}, not the origin DID ${originDid}`;
+    addStep(stepName, "failed", { handle, resolvedDid, error });
+    return {
+      did: originDid, relationship: "handle", status: "failed",
+      handle, resolvedDid, resolvedVia: "http", matchesOrigin: false, error,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    addStep(stepName, "failed", { handle, error: message });
+    return {
+      did: originDid, relationship: "handle", status: "failed",
+      handle, matchesOrigin: false, error: message,
+    };
+  }
+}
+
+// ── Domain Anchoring ───────────────────────────────────────────────
+
+/** Maximum bidirectional alsoKnownAs hops to walk when seeking the origin. */
+const MAX_CHAIN_DEPTH = 5;
+
+/** Extract the host (with port) from a did:web DID, or null if not did:web. */
+function didWebHost(did: string): string | null {
+  if (!did.startsWith("did:web:")) return null;
+  const rest = did.slice("did:web:".length);
+  const firstSegment = rest.split(":")[0];
+  // Port is percent-encoded in did:web (e.g. foo.com%3A8443 → foo.com:8443).
+  return decodeURIComponent(firstSegment);
+}
+
+/** Whether a DID document contains a verification method for the given key. */
+async function docHoldsKey(doc: DidDocument, jwk: EcPublicJwk): Promise<boolean> {
+  return (await findVerificationMethodByThumbprint(doc, jwk)) !== undefined;
+}
+
+/**
+ * Verify that the signing key's identity is bidirectionally anchored to the
+ * request origin domain.
+ *
+ * Anchoring is satisfied when there is a `did:web:<originHost>` identity that
+ * holds the signing key and is reachable from the key's DID through links that
+ * are each bidirectional (mutual `alsoKnownAs`) and key-bearing (both
+ * documents contain the key):
+ *
+ *  - direct: the key's own did:web domain is the request origin; or
+ *  - chain:  a BFS over mutual, key-bearing did:web alsoKnownAs edges reaches
+ *            a member whose host equals the origin.
+ *
+ * A `did:key`/unknown keyid carries no domain, so the walk starts from the
+ * origin document (the identity served at the request origin).
+ */
+async function verifyDomainAnchoring(
+  originHost: string,
+  keyDid: string | null,
+  jwk: EcPublicJwk,
+  originDoc: DidDocument,
+  addStep: AddStep,
+): Promise<DomainAnchorResult> {
+  const chain: DomainAnchorChainMember[] = [];
+  const startDid = keyDid && keyDid.startsWith("did:web:") ? keyDid : originDoc.id;
+
+  // Direct: the key holder's own did:web domain is the request origin.
+  if (didWebHost(startDid) === originHost) {
+    // did:web keyids resolve their key from the holder document by
+    // construction; for did:key confirm the origin document holds the key.
+    const holdsKey = keyDid ? true : await docHoldsKey(originDoc, jwk);
+    if (holdsKey) {
+      addStep("Domain Anchoring", "success", { via: "direct", originHost, keyDid: startDid });
+      return {
+        originHost, keyDid, anchored: true, via: "direct",
+        chain: [{ did: startDid, host: originHost, holdsKey: true, reciprocal: true }],
+      };
+    }
+  }
+
+  addStep("Domain Anchoring", "pending", { originHost, keyDid: startDid });
+
+  // Seed the BFS with the key holder's document.
+  let frontier: Array<{ did: string; doc: DidDocument }>;
+  try {
+    const startDoc = startDid === originDoc.id
+      ? originDoc
+      : await resolveDidDocument(startDid);
+    frontier = [{ did: startDid, doc: startDoc }];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const failure = `Cannot resolve key DID ${startDid}: ${message}`;
+    addStep("Domain Anchoring", "failed", { error: failure });
+    return { originHost, keyDid, anchored: false, via: "none", chain, error: failure };
+  }
+
+  const visited = new Set<string>([startDid]);
+
+  for (let depth = 0; depth < MAX_CHAIN_DEPTH && frontier.length > 0; depth++) {
+    const next: Array<{ did: string; doc: DidDocument }> = [];
+
+    for (const node of frontier) {
+      const akas = Array.isArray(node.doc.alsoKnownAs) ? node.doc.alsoKnownAs : [];
+      for (const aka of akas) {
+        if (!aka.startsWith("did:web:")) continue;
+        if (visited.has(aka)) continue;
+        visited.add(aka);
+
+        try {
+          const linkedDoc = aka === originDoc.id ? originDoc : await resolveDidDocument(aka);
+          const reciprocal = Array.isArray(linkedDoc.alsoKnownAs)
+            && linkedDoc.alsoKnownAs.includes(node.did);
+          const holdsKey = await docHoldsKey(linkedDoc, jwk);
+          const host = didWebHost(aka);
+          chain.push({ did: aka, host, holdsKey, reciprocal });
+
+          if (reciprocal && holdsKey) {
+            if (host === originHost) {
+              addStep("Domain Anchoring", "success", {
+                via: "chain", originHost, anchorDid: aka, hops: depth + 1,
+              });
+              return { originHost, keyDid, anchored: true, via: "chain", chain };
+            }
+            next.push({ did: aka, doc: linkedDoc });
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.log(`[HTTP Sig] Failed to resolve chain member ${aka}:`, message);
+          chain.push({ did: aka, host: didWebHost(aka), holdsKey: false, reciprocal: false });
+        }
+      }
+    }
+
+    frontier = next;
+  }
+
+  const error = `No bidirectional did:web identity in the chain matches the request origin ${originHost}`;
+  addStep("Domain Anchoring", "failed", { originHost, keyDid: startDid, error });
+  return { originHost, keyDid, anchored: false, via: "none", chain, error };
 }
 
 // ── Main Verification Flow ─────────────────────────────────────────
@@ -1041,11 +1314,28 @@ async function verifyHttpSignature(
         }
       }
     } else {
-      // Original path: find VM by id match
-      const vm = findVerificationMethod(didDoc, sigParams.keyid ?? "");
+      // Find VM by id match in the origin document first
+      let vm = findVerificationMethod(didDoc, sigParams.keyid ?? "");
+      let keySource = "origin document";
+
+      // did:web keyids carry their own document — resolve the key there when
+      // it isn't published by the origin (e.g. did:web:bar.com#signing on
+      // a request to foo.com).
+      if (!vm && sigParams.keyid?.startsWith("did:web:")) {
+        const keyDid = sigParams.keyid.split("#")[0];
+        try {
+          const keyDoc = await resolveDidDocument(keyDid);
+          vm = findVerificationMethod(keyDoc, sigParams.keyid);
+          if (vm) keySource = keyDid;
+        } catch (error) {
+          console.log(`[HTTP Sig] Failed to resolve key DID ${keyDid}:`, error);
+        }
+      }
+
       if (vm) {
         jwk = extractPublicKey(vm);
         addStep("Resolve Signing Key", "success", {
+          source: keySource,
           methodId: vm.id,
           type: vm.type,
           keyType: jwk.kty,
@@ -1111,10 +1401,37 @@ async function verifyHttpSignature(
 
     if (isValid) {
       addStep("Verify ECDSA P-256 Signature", "success");
-      result.verified = true;
       console.log("[HTTP Sig] Signature verified successfully");
 
-      // Resolve and validate linked DIDs (controller, alsoKnownAs)
+      // Gate: the signing key's identity must be bidirectionally anchored to
+      // the request origin domain — directly (the key's did:web domain is the
+      // origin) or through a chain of mutual, key-bearing did:web identities.
+      const keyDid = sigParams.keyid && !sigParams.keyid.startsWith("did:key:")
+        ? sigParams.keyid.split("#")[0]
+        : null;
+      const anchoring = await verifyDomainAnchoring(
+        requestInfo.authority,
+        keyDid,
+        jwk,
+        didDoc,
+        addStep,
+      );
+      result.domainAnchoring = anchoring;
+
+      if (anchoring.anchored) {
+        result.verified = true;
+        console.log("[HTTP Sig] Signature verified and domain-anchored");
+      } else {
+        result.verified = false;
+        result.errors.push(
+          anchoring.error
+          ?? "Signing key identity is not anchored to the request origin domain",
+        );
+        console.log("[HTTP Sig] Signature valid but not domain-anchored:", anchoring.error);
+      }
+
+      // Resolve and validate linked DIDs (controller, alsoKnownAs, handle) —
+      // supplementary diagnostics; these never change result.verified.
       try {
         const checkDids = url.searchParams.getAll("check");
         const linkedChecks = await performLinkedDidChecks(
@@ -1129,7 +1446,7 @@ async function verifyHttpSignature(
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         addStep("Linked DID Checks", "failed", { error: msg });
-        // Do NOT change result.verified — the HTTP signature is still valid
+        // Do NOT change result.verified based on supplementary checks
       }
     } else {
       addStep("Verify ECDSA P-256 Signature", "failed");

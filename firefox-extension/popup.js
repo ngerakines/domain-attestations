@@ -62,6 +62,7 @@
       }
       html += "</div>";
     }
+    html += renderDomainAnchoring(item.domainAnchoring);
     html += renderLinkedDidChecks(item.linkedDidChecks ?? []);
     return html;
   }
@@ -78,27 +79,73 @@
       };
       const icon = iconMap[check.status] ?? "\u2022";
       const statusClass = check.status === "skipped" ? "pending" : check.status;
-      const label = check.relationship === "controller" ? "Controller" : "alsoKnownAs";
+      const labelMap = {
+        controller: "Controller",
+        alsoKnownAs: "alsoKnownAs",
+        handle: "Handle"
+      };
+      const label = labelMap[check.relationship];
       let detailsHtml = "";
-      if (check.keyFound !== void 0) {
-        detailsHtml += `Key found: ${check.keyFound}<br>`;
-      }
-      if (check.relationship === "alsoKnownAs" && check.reciprocal !== void 0) {
-        detailsHtml += `Reciprocal: ${check.reciprocal}<br>`;
+      if (check.relationship === "handle") {
+        if (check.resolvedDid) {
+          detailsHtml += `Resolves to: ${escapeHtml(check.resolvedDid)}<br>`;
+        }
+        if (check.matchesOrigin !== void 0) {
+          detailsHtml += `Matches origin DID: ${check.matchesOrigin}<br>`;
+        }
+      } else {
+        if (check.keyFound !== void 0) {
+          detailsHtml += `Key found: ${check.keyFound}<br>`;
+        }
+        if (check.relationship === "alsoKnownAs" && check.reciprocal !== void 0) {
+          detailsHtml += `Reciprocal: ${check.reciprocal}<br>`;
+        }
       }
       if (check.error) {
         detailsHtml += escapeHtml(check.error);
       }
+      const title = check.relationship === "handle" ? `${escapeHtml(label)}: at://${escapeHtml(check.handle ?? "")}` : `${escapeHtml(label)}: ${escapeHtml(check.did)}`;
       html += `
       <div class="step ${statusClass}">
         <div class="step-icon">${icon}</div>
         <div class="step-content">
-          <div class="step-name">${escapeHtml(label)}: ${escapeHtml(check.did)}</div>
+          <div class="step-name">${title}</div>
           ${detailsHtml ? `<div class="step-details">${detailsHtml}</div>` : ""}
         </div>
       </div>
     `;
     }
+    html += "</div></div>";
+    return html;
+  }
+  function renderDomainAnchoring(anchor) {
+    if (!anchor)
+      return "";
+    const icon = anchor.anchored ? "\u2713" : "\u2717";
+    const statusClass = anchor.anchored ? "success" : "failed";
+    const summary = anchor.anchored ? `Anchored to ${escapeHtml(anchor.originHost)} (${anchor.via})` : `Not anchored to ${escapeHtml(anchor.originHost)}`;
+    let html = '<div class="detail-section"><h3>Domain Anchoring</h3>';
+    html += '<div class="step-list">';
+    let detailsHtml = "";
+    if (anchor.keyDid) {
+      detailsHtml += `Key DID: ${escapeHtml(anchor.keyDid)}<br>`;
+    }
+    for (const member of anchor.chain) {
+      const memberIcon = member.holdsKey && member.reciprocal ? "\u2713" : "\u2717";
+      detailsHtml += `${memberIcon} ${escapeHtml(member.did)} (key: ${member.holdsKey}, reciprocal: ${member.reciprocal})<br>`;
+    }
+    if (anchor.error) {
+      detailsHtml += escapeHtml(anchor.error);
+    }
+    html += `
+    <div class="step ${statusClass}">
+      <div class="step-icon">${icon}</div>
+      <div class="step-content">
+        <div class="step-name">${summary}</div>
+        ${detailsHtml ? `<div class="step-details">${detailsHtml}</div>` : ""}
+      </div>
+    </div>
+  `;
     html += "</div></div>";
     return html;
   }
@@ -187,6 +234,7 @@
       }
       detailsHtml += "</div>";
     }
+    detailsHtml += renderDomainAnchoring(result.domainAnchoring);
     detailsHtml += renderLinkedDidChecks(result.linkedDidChecks ?? []);
     if (result.duration) {
       detailsHtml += `
