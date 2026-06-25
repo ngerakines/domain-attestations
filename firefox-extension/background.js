@@ -469,6 +469,15 @@
         checks.push(await checkLinkedDid(aka, didDoc.id, referenceJwk, "alsoKnownAs", addStep));
       }
     }
+    if (didDoc.alsoKnownAs) {
+      for (const aka of didDoc.alsoKnownAs) {
+        const handle = parseAtHandle(aka);
+        if (!handle)
+          continue;
+        checks.push(await checkLinkedHandle(handle, didDoc.id, addStep));
+        break;
+      }
+    }
     for (const did of extraDids) {
       if (!did.startsWith("did:"))
         continue;
@@ -477,6 +486,184 @@
       checks.push(await checkLinkedDid(did, didDoc.id, referenceJwk, "alsoKnownAs", addStep));
     }
     return checks;
+  }
+  var RESERVED_HANDLE_TLDS = /* @__PURE__ */ new Set([
+    "local",
+    "arpa",
+    "internal",
+    "invalid",
+    "localhost",
+    "onion",
+    "example",
+    "alt",
+    "test"
+  ]);
+  function parseAtHandle(aka) {
+    if (!aka.startsWith("at://"))
+      return null;
+    const rest = aka.slice("at://".length);
+    if (/[/?#@]/.test(rest))
+      return null;
+    const handle = rest.toLowerCase();
+    if (handle.length === 0 || handle.length > 253)
+      return null;
+    const labels = handle.split(".");
+    if (labels.length < 2)
+      return null;
+    const labelRe = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+    for (const label of labels) {
+      if (label.length < 1 || label.length > 63)
+        return null;
+      if (!labelRe.test(label))
+        return null;
+    }
+    const tld = labels[labels.length - 1];
+    if (RESERVED_HANDLE_TLDS.has(tld))
+      return null;
+    if (/^[0-9]+$/.test(tld))
+      return null;
+    return handle;
+  }
+  async function resolveHandleToDid(handle) {
+    const url = `https://${handle}/.well-known/atproto-did`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5e3);
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} from ${url}`);
+      }
+      const body = (await response.text()).trim().split(/\s+/)[0] ?? "";
+      if (!body.startsWith("did:")) {
+        throw new Error(`Response is not a DID: ${body.slice(0, 64)}`);
+      }
+      return body;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  async function checkLinkedHandle(handle, originDid, addStep) {
+    const stepName = `Resolve handle: at://${handle}`;
+    addStep(stepName, "pending", { handle });
+    try {
+      const resolvedDid = await resolveHandleToDid(handle);
+      const matchesOrigin = resolvedDid === originDid;
+      if (matchesOrigin) {
+        addStep(stepName, "success", { handle, resolvedDid });
+        return {
+          did: originDid,
+          relationship: "handle",
+          status: "success",
+          handle,
+          resolvedDid,
+          resolvedVia: "http",
+          matchesOrigin: true
+        };
+      }
+      const error = `Handle resolves to ${resolvedDid}, not the origin DID ${originDid}`;
+      addStep(stepName, "failed", { handle, resolvedDid, error });
+      return {
+        did: originDid,
+        relationship: "handle",
+        status: "failed",
+        handle,
+        resolvedDid,
+        resolvedVia: "http",
+        matchesOrigin: false,
+        error
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      addStep(stepName, "failed", { handle, error: message });
+      return {
+        did: originDid,
+        relationship: "handle",
+        status: "failed",
+        handle,
+        matchesOrigin: false,
+        error: message
+      };
+    }
+  }
+  var MAX_CHAIN_DEPTH = 5;
+  function didWebHost(did) {
+    if (!did.startsWith("did:web:"))
+      return null;
+    const rest = did.slice("did:web:".length);
+    const firstSegment = rest.split(":")[0];
+    return decodeURIComponent(firstSegment);
+  }
+  async function docHoldsKey(doc, jwk) {
+    return await findVerificationMethodByThumbprint(doc, jwk) !== void 0;
+  }
+  async function verifyDomainAnchoring(originHost, keyDid, jwk, originDoc, addStep) {
+    const chain = [];
+    const startDid = keyDid && keyDid.startsWith("did:web:") ? keyDid : originDoc.id;
+    if (didWebHost(startDid) === originHost) {
+      const holdsKey = keyDid ? true : await docHoldsKey(originDoc, jwk);
+      if (holdsKey) {
+        addStep("Domain Anchoring", "success", { via: "direct", originHost, keyDid: startDid });
+        return {
+          originHost,
+          keyDid,
+          anchored: true,
+          via: "direct",
+          chain: [{ did: startDid, host: originHost, holdsKey: true, reciprocal: true }]
+        };
+      }
+    }
+    addStep("Domain Anchoring", "pending", { originHost, keyDid: startDid });
+    let frontier;
+    try {
+      const startDoc = startDid === originDoc.id ? originDoc : await resolveDidDocument(startDid);
+      frontier = [{ did: startDid, doc: startDoc }];
+    } catch (error2) {
+      const message = error2 instanceof Error ? error2.message : String(error2);
+      const failure = `Cannot resolve key DID ${startDid}: ${message}`;
+      addStep("Domain Anchoring", "failed", { error: failure });
+      return { originHost, keyDid, anchored: false, via: "none", chain, error: failure };
+    }
+    const visited = /* @__PURE__ */ new Set([startDid]);
+    for (let depth = 0; depth < MAX_CHAIN_DEPTH && frontier.length > 0; depth++) {
+      const next = [];
+      for (const node of frontier) {
+        const akas = Array.isArray(node.doc.alsoKnownAs) ? node.doc.alsoKnownAs : [];
+        for (const aka of akas) {
+          if (!aka.startsWith("did:web:"))
+            continue;
+          if (visited.has(aka))
+            continue;
+          visited.add(aka);
+          try {
+            const linkedDoc = aka === originDoc.id ? originDoc : await resolveDidDocument(aka);
+            const reciprocal = Array.isArray(linkedDoc.alsoKnownAs) && linkedDoc.alsoKnownAs.includes(node.did);
+            const holdsKey = await docHoldsKey(linkedDoc, jwk);
+            const host = didWebHost(aka);
+            chain.push({ did: aka, host, holdsKey, reciprocal });
+            if (reciprocal && holdsKey) {
+              if (host === originHost) {
+                addStep("Domain Anchoring", "success", {
+                  via: "chain",
+                  originHost,
+                  anchorDid: aka,
+                  hops: depth + 1
+                });
+                return { originHost, keyDid, anchored: true, via: "chain", chain };
+              }
+              next.push({ did: aka, doc: linkedDoc });
+            }
+          } catch (error2) {
+            const message = error2 instanceof Error ? error2.message : String(error2);
+            console.log(`[HTTP Sig] Failed to resolve chain member ${aka}:`, message);
+            chain.push({ did: aka, host: didWebHost(aka), holdsKey: false, reciprocal: false });
+          }
+        }
+      }
+      frontier = next;
+    }
+    const error = `No bidirectional did:web identity in the chain matches the request origin ${originHost}`;
+    addStep("Domain Anchoring", "failed", { originHost, keyDid: startDid, error });
+    return { originHost, keyDid, anchored: false, via: "none", chain, error };
   }
   async function verifyHttpSignature(details) {
     const startTime = Date.now();
@@ -630,10 +817,23 @@
           }
         }
       } else {
-        const vm = findVerificationMethod(didDoc, sigParams.keyid ?? "");
+        let vm = findVerificationMethod(didDoc, sigParams.keyid ?? "");
+        let keySource = "origin document";
+        if (!vm && sigParams.keyid?.startsWith("did:web:")) {
+          const keyDid = sigParams.keyid.split("#")[0];
+          try {
+            const keyDoc = await resolveDidDocument(keyDid);
+            vm = findVerificationMethod(keyDoc, sigParams.keyid);
+            if (vm)
+              keySource = keyDid;
+          } catch (error) {
+            console.log(`[HTTP Sig] Failed to resolve key DID ${keyDid}:`, error);
+          }
+        }
         if (vm) {
           jwk = extractPublicKey(vm);
           addStep("Resolve Signing Key", "success", {
+            source: keySource,
             methodId: vm.id,
             type: vm.type,
             keyType: jwk.kty,
@@ -693,8 +893,26 @@
       const isValid = await verifyEcdsaSignature(jwk, signature, signatureBase);
       if (isValid) {
         addStep("Verify ECDSA P-256 Signature", "success");
-        result.verified = true;
         console.log("[HTTP Sig] Signature verified successfully");
+        const keyDid = sigParams.keyid && !sigParams.keyid.startsWith("did:key:") ? sigParams.keyid.split("#")[0] : null;
+        const anchoring = await verifyDomainAnchoring(
+          requestInfo.authority,
+          keyDid,
+          jwk,
+          didDoc,
+          addStep
+        );
+        result.domainAnchoring = anchoring;
+        if (anchoring.anchored) {
+          result.verified = true;
+          console.log("[HTTP Sig] Signature verified and domain-anchored");
+        } else {
+          result.verified = false;
+          result.errors.push(
+            anchoring.error ?? "Signing key identity is not anchored to the request origin domain"
+          );
+          console.log("[HTTP Sig] Signature valid but not domain-anchored:", anchoring.error);
+        }
         try {
           const checkDids = url.searchParams.getAll("check");
           const linkedChecks = await performLinkedDidChecks(
