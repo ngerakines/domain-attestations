@@ -4,19 +4,13 @@ Cryptographic domain attestations for AT Protocol `did:web` identities using [RF
 
 This project demonstrates how HTTP responses serving DID documents can be signed with ECDSA P-256, enabling consumers to verify that a `did:web` DID document was genuinely produced by the holder of a specific private key. By binding a domain's DID document to a cryptographic signature, we create a trust anchor that is independently verifiable without relying on TLS certificate authority infrastructure alone.
 
-Companion implementation for the paper:
-
-> **Onions in the ATmosphere: Decentralizing Trust in Identity**
-> Paul Syverson & Nick Gerakines
-> *FOCI 2026 (Free and Open Communications on the Internet)*
-
 ## Background
 
 The AT Protocol uses two DID methods: `did:plc` (registered in a public ledger) and `did:web` (resolved via HTTPS from a domain). While `did:plc` is self-certifying, `did:web` relies on the security of DNS and TLS for authenticity. This means `did:web` inherits the blocking, hijacking, fingerprinting, and surveillance risks of traditional web domains.
 
 RFC 9421 HTTP Message Signatures provide a mechanism to sign HTTP responses with a key whose identity is embedded in the DID document itself. A server signs its `/.well-known/did.json` response, and any client can verify the signature against the public key published in that document. This creates a cryptographic binding between the domain and the DID document it serves, independent of the TLS layer.
 
-The FOCI'26 paper explores how this technique combines with existing approaches to self-certifying meaningful identity (SCMI), including union associations, onion associations, and contextual trust. It describes how `did:web` domain attestations, together with AT Protocol's existing `did:plc` method, enable stronger blocking resistance and manipulation resistance for decentralized identity.
+The paper explores how this technique combines with existing approaches to self-certifying meaningful identity (SCMI), including union associations, onion associations, and contextual trust. It describes how `did:web` domain attestations, together with AT Protocol's existing `did:plc` method, enable stronger blocking resistance and manipulation resistance for decentralized identity.
 
 ## Architecture
 
